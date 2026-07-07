@@ -33,6 +33,29 @@ class WorkerState(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+
+class EntityExtractionState(BaseModel):
+    """实体抽取 Worker 的子状态"""
+    chunk_index: int = 0
+    text: str = ""
+    entity_type: str = ""
+    attributes: str = ""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class DeepAnalysisState(BaseModel):
+    """深度分析 Worker 的子状态"""
+    agent_id: str = ""
+    role: str = ""
+    entity_info: str = ""
+    context: str = ""
+    question: str = ""
+
+    class Config:
+        arbitrary_types_allowed = True
+
 class TaskPlan(BaseModel):
     tasks: List[SubTask]
 
@@ -50,7 +73,9 @@ def _merge_list(left: List, right: List) -> List:
         left = []
     if right is None:
         right = []
-    return left + right
+    if isinstance(right, list):
+        return left + right
+    return left + [right]
 
 class AgentState(BaseModel):
     """多 Agent 系统的全局状态"""
@@ -74,6 +99,9 @@ class AgentState(BaseModel):
 
     # ===== 任务编排 =====
     task_plan: Optional[dict] = None
+    entity_schema: Optional[dict] = None
+    extracted_entities: Annotated[List[dict], _merge_list] = Field(default_factory=list)
+    merged_entities: Optional[List[dict]] = None
     worker_results: Annotated[Dict[str, Any], _merge_dict] = Field(default_factory=dict)
     final_answer: Optional[str] = None
 

@@ -18,15 +18,19 @@ from src.agents.prompts import (
     DEEP_ANALYSIS_SUPERVISOR_PROMPT,
     DEEP_ANALYSIS_WORKER_PROMPT,
     DEEP_ANALYSIS_QUALITY_PROMPT,
+    DEEP_ANALYSIS_REDUCE_PROMPT,
+    ENTITY_EXTRACTION_PROMPT,
+    ENTITY_MERGE_PROMPT,
     TOOL_CALL_QUALITY_PROMPT,
     FILE_PATH_EXTRACTION_PROMPT,
 )
 from src.context.compressor import ContextCompressor
 from src.core.config import settings
-from src.core.state import AgentState, IntentType, WorkerState
+from src.core.state import AgentState, IntentType, WorkerState, EntityExtractionState, DeepAnalysisState
 from src.utils.llm_utils import create_llm, invoke_with_retry
 from src.utils.doc_parser import parse_file, parse_file_chunked
 from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ===== 惰性初始化 =====
 llm: ChatOpenAI = None
@@ -43,6 +47,7 @@ def _ensure_llm():
             max_tokens=settings.max_context_tokens,
             chunk_size=settings.compression_chunk_size * 4,
             max_workers=settings.max_concurrent_workers,
+            max_retries=settings.llm_max_retries,
         )
         _worker_semaphore = threading.Semaphore(settings.max_concurrent_workers)
 
@@ -323,9 +328,9 @@ def _invoke_compressor(text: str, strategy: str) -> Tuple[str, int]:
 def supervisor_node(state: AgentState) -> AgentState:
     context_to_use = state.compressed_context or state.raw_context
 
-    if state.intent == IntentType.DEEP_ANALYSIS and context_to_use:
+    if state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS) and context_to_use:
         prompt = DEEP_ANALYSIS_SUPERVISOR_PROMPT.format(
-            context=context_to_use,
+            context=context_to_use[:8000],
             question=state.original_input,
         )
     else:
@@ -336,20 +341,211 @@ def supervisor_node(state: AgentState) -> AgentState:
     try:
         parsed = json.loads(response)
         state.task_plan = parsed
+        state.entity_schema = parsed.get("entity_schema")
     except (json.JSONDecodeError, TypeError):
         logger.warning("任务拆解 JSON 解析失败，使用兜底计划")
         state.task_plan = {"tasks": [{"id": 1, "description": "全面分析", "assigned_to": "analyst_1", "role": "你是一个领域分析专家，擅长从给定角度进行深入分析。"}]}
+        state.entity_schema = None
 
     tasks = state.task_plan.get("tasks", []) if state.task_plan else []
+    schema_info = ""
+    if state.entity_schema:
+        schema_info = f" | 实体类型: {state.entity_schema.get('entity_type', '?')}, 属性: {state.entity_schema.get('attributes', [])}"
     _record_step(state, "supervisor", tokens)
-    logger.info(f"任务拆解完成，共 {len(tasks)} 个子任务")
+    logger.info(f"任务拆解完成，共 {len(tasks)} 个子任务{schema_info}")
     for t in tasks:
         logger.info(f"  📋 {t.get('assigned_to', '?')}: {t.get('description', '?')}")
 
     return state
 
 
-# ===== 多 Agent 并行分发 =====
+# ===== 路由：有 entity_schema 走两阶段，否则走旧流程 =====
+
+def route_after_supervisor(state: AgentState):
+    """有 entity_schema 走两阶段实体抽取，否则走旧 worker 流程"""
+    if state.entity_schema:
+        logger.info(f"route_after_supervisor: 走两阶段流程 (entity_schema={state.entity_schema})")
+        result = route_to_entity_extractors(state)
+        logger.info(f"route_to_entity_extractors 返回: {type(result).__name__}, 数量: {len(result) if isinstance(result, list) else 'N/A'}")
+        return result
+    else:
+        logger.info("route_after_supervisor: 走旧 worker 流程 (无 entity_schema)")
+        result = route_to_workers(state)
+        logger.info(f"route_to_workers 返回: {type(result).__name__}, 数量: {len(result) if isinstance(result, list) else 'N/A'}")
+        return result
+
+
+# ===== 阶段1：实体抽取（Map 并行） =====
+
+def route_to_entity_extractors(state: AgentState):
+    context_to_use = state.compressed_context or state.raw_context
+    if not context_to_use or not state.entity_schema:
+        return "entity_merge"
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.compression_chunk_size * 4,
+        chunk_overlap=int(settings.compression_chunk_size * 0.4),
+        length_function=len,
+    )
+    chunks = splitter.split_text(context_to_use)
+    logger.info(f"实体抽取：上下文分为 {len(chunks)} 个 chunk")
+
+    sends = []
+    for i, chunk in enumerate(chunks):
+        extraction_state = EntityExtractionState(
+            chunk_index=i,
+            text=chunk,
+            entity_type=state.entity_schema.get("entity_type", "实体"),
+            attributes=", ".join(state.entity_schema.get("attributes", [])),
+        )
+        sends.append(Send("entity_extraction", extraction_state))
+    logger.info(f"分发 {len(sends)} 个并行实体抽取 Worker")
+    return sends
+
+
+def entity_extraction_node(state: EntityExtractionState) -> dict:
+    _ensure_llm()
+    _worker_semaphore.acquire()
+    try:
+        prompt = ENTITY_EXTRACTION_PROMPT.format(
+            entity_type=state.entity_type,
+            attributes=state.attributes,
+            text=state.text,
+        )
+        logger.info(f"  🔍 chunk {state.chunk_index} 正在抽取实体...")
+        start = time.time()
+
+        content, tokens = invoke_with_retry(
+            llm,
+            prompt,
+            max_retries=settings.llm_max_retries,
+            base_delay=settings.llm_retry_base_delay,
+            fallback="[]",
+        )
+
+        entities = []
+        try:
+            entities = json.loads(content)
+            if not isinstance(entities, list):
+                entities = []
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"  chunk {state.chunk_index} 实体 JSON 解析失败")
+            entities = []
+
+        elapsed = time.time() - start
+        logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个实体)")
+        return {"extracted_entities": entities}
+    finally:
+        _worker_semaphore.release()
+
+
+# ===== 阶段1.5：实体合并 =====
+
+def entity_merge_node(state: AgentState) -> AgentState:
+    if not state.extracted_entities:
+        logger.warning("无实体抽取结果，跳过合并")
+        state.merged_entities = []
+        _record_step(state, "entity_merge")
+        return state
+
+    all_entities = []
+    for ent_list in state.extracted_entities:
+        if isinstance(ent_list, list):
+            all_entities.extend(ent_list)
+        elif isinstance(ent_list, dict):
+            all_entities.append(ent_list)
+
+    logger.info(f"实体合并：共 {len(all_entities)} 个原始实体")
+
+    if len(all_entities) > 200:
+        batch_size = 200
+        merged_batches = []
+        for i in range(0, len(all_entities), batch_size):
+            batch = all_entities[i:i + batch_size]
+            merged = _merge_entities_batch(batch, state.entity_schema)
+            merged_batches.extend(merged)
+        state.merged_entities = merged_batches
+    else:
+        state.merged_entities = _merge_entities_batch(all_entities, state.entity_schema)
+
+    logger.info(f"实体合并完成：{len(state.merged_entities)} 个合并后实体")
+    _record_step(state, "entity_merge")
+    return state
+
+
+def _merge_entities_batch(entities: list, schema: dict) -> list:
+    entity_type = schema.get("entity_type", "实体") if schema else "实体"
+    prompt = ENTITY_MERGE_PROMPT.format(
+        entity_type=entity_type,
+        entities=json.dumps(entities, ensure_ascii=False),
+    )
+    content, tokens = _invoke(prompt, fallback="[]", node_name="entity_merge")
+    try:
+        merged = json.loads(content)
+        if isinstance(merged, list):
+            return merged
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("实体合并 JSON 解析失败，返回原始实体")
+    return entities
+
+
+# ===== 阶段2：深度分析（Reduce 并行） =====
+
+def route_to_deep_analysts(state: AgentState):
+    if not state.merged_entities:
+        return "aggregate"
+
+    context_to_use = state.compressed_context or state.raw_context
+    tasks = state.task_plan.get("tasks", []) if state.task_plan else []
+
+    sends = []
+    for i, entity in enumerate(state.merged_entities):
+        task = tasks[i % len(tasks)] if tasks else {}
+        role = task.get("role", "你是一个领域分析专家，擅长深入分析。")
+
+        entity_info = json.dumps(entity, ensure_ascii=False, indent=2)
+        analysis_state = DeepAnalysisState(
+            agent_id=f"analyst_{i + 1}",
+            role=role,
+            entity_info=entity_info,
+            context=context_to_use[:8000],
+            question=state.original_input,
+        )
+        sends.append(Send("deep_analysis", analysis_state))
+
+    logger.info(f"分发 {len(sends)} 个并行深度分析 Worker")
+    return sends
+
+
+def deep_analysis_node(state: DeepAnalysisState) -> dict:
+    _ensure_llm()
+    _worker_semaphore.acquire()
+    try:
+        prompt = DEEP_ANALYSIS_REDUCE_PROMPT.format(
+            role=state.role,
+            entity_info=state.entity_info,
+            context=state.context,
+            question=state.question,
+        )
+        logger.info(f"  🤖 {state.agent_id} 正在深度分析...")
+        start = time.time()
+
+        content, tokens = invoke_with_retry(
+            llm,
+            prompt,
+            max_retries=settings.llm_max_retries,
+            base_delay=settings.llm_retry_base_delay,
+            fallback="分析失败，无结果。",
+        )
+
+        elapsed = time.time() - start
+        logger.info(f"  ✅ {state.agent_id} 深度分析完成 ({elapsed:.1f}s, tokens={tokens})")
+        return {"worker_results": {state.agent_id: content}}
+    finally:
+        _worker_semaphore.release()
+
+
+# ===== 旧流程：直接 worker 分发（无 entity_schema 时） =====
 
 def route_to_workers(state: AgentState):
     context_to_use = state.compressed_context or state.raw_context
@@ -370,8 +566,6 @@ def route_to_workers(state: AgentState):
     logger.info(f"分发 {len(sends)} 个并行 Worker (并发上限: {settings.max_concurrent_workers})")
     return sends
 
-
-# ===== 单个 Worker 节点（并行执行） =====
 
 def worker_agent_node(state: WorkerState) -> dict:
     _ensure_llm()
@@ -403,13 +597,12 @@ def worker_agent_node(state: WorkerState) -> dict:
 # ===== 汇总节点 =====
 
 def aggregate_node(state: AgentState) -> AgentState:
-    worker_tokens = 0
     if state.worker_results:
         logger.info(f"汇总 {len(state.worker_results)} 个 Worker 结果")
     else:
         logger.warning("无 Worker 结果汇总")
 
-    _record_step(state, "aggregate", worker_tokens)
+    _record_step(state, "aggregate")
     return state
 
 
@@ -419,7 +612,7 @@ def quality_harness_node(state: AgentState) -> AgentState:
     if state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS):
         prompt = DEEP_ANALYSIS_QUALITY_PROMPT.format(
             question=state.original_input,
-            tasks=json.dumps(state.task_plan, ensure_ascii=False),
+            tasks=json.dumps(state.task_plan, ensure_ascii=False) if state.task_plan else "{}",
             results=json.dumps(state.worker_results, ensure_ascii=False),
         )
     elif state.intent == IntentType.TOOL_CALL:
@@ -453,7 +646,7 @@ def quality_harness_node(state: AgentState) -> AgentState:
     return state
 
 
-def should_retry(state: AgentState) -> Literal["supervisor_node", "finalize"]:
+def should_retry(state: AgentState) -> Literal["supervisor", "finalize"]:
     if state.quality_score is not None and state.quality_score < settings.quality_threshold:
         if state.retry_count < state.max_retries:
             state.retry_count += 1
@@ -475,6 +668,9 @@ def build_agent_graph():
     workflow.add_node("file_reader", file_reader_node)
     workflow.add_node("compress_context", compress_context_node)
     workflow.add_node("supervisor", supervisor_node)
+    workflow.add_node("entity_extraction", entity_extraction_node)
+    workflow.add_node("entity_merge", entity_merge_node)
+    workflow.add_node("deep_analysis", deep_analysis_node)
     workflow.add_node("worker", worker_agent_node)
     workflow.add_node("aggregate", aggregate_node)
     workflow.add_node("quality_harness", quality_harness_node)
@@ -503,12 +699,21 @@ def build_agent_graph():
     )
     workflow.add_edge("compress_context", "supervisor")
 
-    # supervisor → 并行分发到多个 worker → 汇总
+    # supervisor → 根据是否有 entity_schema 分流
+    # 有：并行 entity_extraction → entity_merge → 并行 deep_analysis → aggregate
+    # 无：并行 worker → aggregate
     workflow.add_conditional_edges(
         "supervisor",
-        route_to_workers,
-        [["worker"], "aggregate"],
+        route_after_supervisor,
+        [["entity_extraction", "worker"], "entity_merge", "aggregate"],
     )
+    workflow.add_edge("entity_extraction", "entity_merge")
+    workflow.add_conditional_edges(
+        "entity_merge",
+        route_to_deep_analysts,
+        [["deep_analysis"], "aggregate"],
+    )
+    workflow.add_edge("deep_analysis", "aggregate")
     workflow.add_edge("worker", "aggregate")
 
     workflow.add_edge("aggregate", "quality_harness")
