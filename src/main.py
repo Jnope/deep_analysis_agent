@@ -6,77 +6,58 @@ from src.core.state import AgentState
 
 
 def main():
-    parser = argparse.ArgumentParser(description="多Agent长文本解析系统")
-    parser.add_argument("--input", "-i", type=str, default="", help="用户问题/需求")
-    parser.add_argument("--context", "-c", type=str, default="", help="上下文/文档内容")
-    parser.add_argument("--context-file", "-f", type=str, default="", help="上下文文件路径（大文件推荐）")
-    parser.add_argument("--max-retries", type=int, default=3, help="最大重试次数")
+    parser = argparse.ArgumentParser(description="小说角色卡生成 Agent")
+    parser.add_argument("--file", "-f", type=str, default="", help="小说 TXT 文件路径")
+    parser.add_argument("--requirement", "-r", type=str, default="", help="角色卡生成需求（可留空，默认生成全部角色）")
+    parser.add_argument("--max-retries", type=int, default=3, help="质量不合格时最大重试次数")
 
     args = parser.parse_args()
 
-    if not args.input:
-        args.input = input("请输入你的问题/需求: ")
+    if not args.file:
+        args.file = input("请输入小说文件路径: ").strip()
 
-    context = args.context
-    context_path = args.context_file
-
-    if not context and not context_path:
-        try:
-            context = input("请输入上下文/文档内容(直接回车跳过): ")
-        except EOFError:
-            context = ""
+    requirement = args.requirement or "分析这部小说中的所有角色，为每个（含转变的不同时期）生成角色卡（性格、好坏、性别、年龄等）及音色参数。"
 
     print(f"\n{'='*60}")
-    print(f"问题: {args.input}")
-    if context:
-        print(f"上下文长度: {len(context)} 字符")
-    if context_path:
-        print(f"上下文文件: {context_path}")
+    print(f"小说文件: {args.file}")
+    print(f"生成需求: {requirement}")
     print(f"{'='*60}\n")
 
     graph = build_agent_graph()
 
     initial_state = AgentState(
-        original_input=args.input,
-        raw_context=context,
-        context_path=context_path,
+        original_input=f"分析小说文件 {args.file}。{requirement}",
+        context_path=args.file,
         max_retries=args.max_retries,
     )
 
     final_state = graph.invoke(initial_state)
 
     print(f"\n{'='*60}")
-    print("【最终结果】")
+    print("【角色卡结果】")
 
-    character_cards = final_state.get("character_cards")
-    if character_cards:
-        print(f"\n共生成 {len(character_cards)} 张角色卡：\n")
-        for i, card in enumerate(character_cards, 1):
-            name = card.get("name", "?")
-            period = card.get("period", "全程")
-            print(f"--- 角色卡 #{i}: {name} ({period}) ---")
-            # print(json.dumps(card, ensure_ascii=False, indent=2))
-    elif final_state.get("direct_answer"):
-        print(final_state["direct_answer"])
-    elif final_state.get("final_answer"):
-        print(final_state["final_answer"])
-    elif final_state.get("worker_results"):
-        results = final_state["worker_results"]
-        if isinstance(results, dict):
-            for agent_id, content in results.items():
-                print(f"\n--- {agent_id} ---")
-                print(content)
-        else:
-            print(results)
+    direct_answer = final_state.get("direct_answer")
+    if direct_answer:
+        print(direct_answer)
     else:
-        print("（无输出结果）")
+        character_cards = final_state.get("character_cards") or {}
+        if isinstance(character_cards, dict):
+            character_cards = list(character_cards.values())
+        if character_cards:
+            print(f"\n共生成 {len(character_cards)} 张角色卡：\n")
+            for i, card in enumerate(character_cards, 1):
+                name = card.get("name", "?")
+                period = card.get("period", "全程")
+                print(f"--- #{i} {name} ({period}) ---")
+                print(json.dumps(card, ensure_ascii=False, indent=2))
+                print()
+        else:
+            print("（未能生成任何角色卡）")
 
-    if final_state.get("quality_score"):
+    if final_state.get("quality_score") is not None:
         print(f"\n质量评分: {final_state['quality_score']:.2f}")
     if final_state.get("total_tokens_used"):
         print(f"总 token 消耗: {final_state['total_tokens_used']}")
-    if final_state.get("total_cost"):
-        print(f"总费用: ${final_state['total_cost']:.6f}")
     steps = final_state.get("execution_steps", [])
     if steps:
         print("\n执行步骤:")

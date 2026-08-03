@@ -1,58 +1,11 @@
-from typing import List, Dict, Any, Optional, Literal, Annotated
-from langchain_core.messages import BaseMessage
+from typing import List, Dict, Any, Optional, Annotated
 from pydantic import BaseModel, Field
-from enum import Enum
-import operator
-
-
-class CompressionStrategy(str, Enum):
-    MAP_REDUCE = "map_reduce"
-    STUFF = "stuff"
-    EXTRACTIVE = "extractive"
-    AUTO = "auto"
-
-class IntentType(str, Enum):
-    DIRECT_ANSWER = "direct_answer"
-    TOOL_CALL = "tool_call"
-    DEEP_ANALYSIS = "deep_analysis"
-    FILE_ANALYSIS = "file_analysis"
-
-class SubTask(BaseModel):
-    id: int
-    description: str
-    assigned_to: str
-    role: str = ""
-
-class WorkerState(BaseModel):
-    """单个 Worker 的子状态，用于并行分发"""
-    agent_id: str = ""
-    role: str = ""
-    task_description: str = ""
-    context: str = ""
-
-    class Config:
-        arbitrary_types_allowed = True
 
 
 class EntityExtractionState(BaseModel):
-    """实体抽取 Worker 的子状态"""
+    """角色抽取 Worker 的子状态，保留 chunk_index 记录时间线"""
     chunk_index: int = 0
     text: str = ""
-    entity_type: str = ""
-    attributes: str = ""
-    is_character_analysis: bool = False
-
-    class Config:
-        arbitrary_types_allowed = True
-
-
-class DeepAnalysisState(BaseModel):
-    """深度分析 Worker 的子状态"""
-    agent_id: str = ""
-    role: str = ""
-    entity_info: str = ""
-    context: str = ""
-    question: str = ""
 
     class Config:
         arbitrary_types_allowed = True
@@ -69,8 +22,6 @@ class CharacterCardState(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-class TaskPlan(BaseModel):
-    tasks: List[SubTask]
 
 def _merge_dict(left: Dict, right: Dict) -> Dict:
     if left is None:
@@ -81,6 +32,7 @@ def _merge_dict(left: Dict, right: Dict) -> Dict:
     result.update(right)
     return result
 
+
 def _merge_list(left: List, right: List) -> List:
     if left is None:
         left = []
@@ -90,41 +42,27 @@ def _merge_list(left: List, right: List) -> List:
         return left + right
     return left + [right]
 
+
 class AgentState(BaseModel):
-    """多 Agent 系统的全局状态"""
+    """小说角色卡生成 Agent 的全局状态"""
 
-    # ===== 基础消息 =====
-    messages: List[BaseMessage] = Field(default_factory=list)
-    original_input: str = ""
+    original_input: str = ""          # 用户需求（应包含小说文件路径）
+    context_path: str = ""            # 小说文件路径
 
-    # ===== 意图识别 =====
-    intent: Optional[IntentType] = None
-    direct_answer: Optional[str] = None
     extracted_file_paths: List[str] = Field(default_factory=list)
+    text_chunks: Annotated[List[str], _merge_list] = Field(default_factory=list)  # 段落分块，保留顺序
 
-    # ===== 上下文压缩 =====
-    context_path: str = ""  # 文件路径，优先于 raw_context
-    raw_context: str = ""
-    text_chunks: Annotated[List[str], _merge_list] = Field(default_factory=list)  # 段落分块，避免拼接全文
-    compressed_context: Optional[str] = None
-    compression_ratio: float = 0.0
-    compression_strategy: CompressionStrategy = CompressionStrategy.AUTO
-    compression_quality: Optional[float] = None
-
-    # ===== 任务编排 =====
-    task_plan: Optional[dict] = None
-    entity_schema: Optional[dict] = None
     is_character_analysis: bool = False
-    extracted_entities: Annotated[List[dict], _merge_list] = Field(default_factory=list)
-    merged_entities: Optional[List[dict]] = None
-    character_evolution: Dict[str, List[dict]] = Field(default_factory=dict)
-    character_cards: Annotated[List[dict], _merge_list] = Field(default_factory=list)
-    worker_results: Annotated[Dict[str, Any], _merge_dict] = Field(default_factory=dict)
-    final_answer: Optional[str] = None
+    direct_answer: Optional[str] = None   # 文件读取失败时的提示
 
-    # ===== Harness 评估 =====
+    extracted_entities: Annotated[List[dict], _merge_list] = Field(default_factory=list)  # 各块抽取的角色
+    merged_entities: Optional[List[dict]] = None                                          # 合并去重后的角色
+    character_evolution: Dict[str, List[dict]] = Field(default_factory=dict)              # 角色 → 时期列表
+    character_cards: Annotated[Dict[str, dict], _merge_dict] = Field(default_factory=dict)  # agent_id → 角色卡
+
+    # ===== 质量评估 =====
     quality_score: Optional[float] = None
-    quality_details: Annotated[Dict[str, float], _merge_dict] = Field(default_factory=dict)
+    quality_details: Dict[str, float] = Field(default_factory=dict)
     retry_count: int = 0
     max_retries: int = 3
 
@@ -132,12 +70,3 @@ class AgentState(BaseModel):
     total_tokens_used: int = 0
     total_cost: float = 0.0
     execution_steps: Annotated[List[str], _merge_list] = Field(default_factory=list)
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-
-    # ===== 记忆 =====
-    short_term_memory: List[BaseMessage] = Field(default_factory=list)
-    long_term_memory_context: Optional[str] = None
-
-    class Config:
-        arbitrary_types_allowed = True
