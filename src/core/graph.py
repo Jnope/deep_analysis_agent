@@ -3,7 +3,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Literal, Tuple
+from typing import List, Literal, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.constants import END
@@ -23,14 +23,30 @@ from src.agents.prompts import (
     ENTITY_MERGE_PROMPT,
     TOOL_CALL_QUALITY_PROMPT,
     FILE_PATH_EXTRACTION_PROMPT,
+    CHARACTER_SUPERVISOR_PROMPT,
+    CHARACTER_EXTRACTION_PROMPT,
+    CHARACTER_MERGE_PROMPT,
+    CHARACTER_EVOLUTION_PROMPT,
+    CHARACTER_CARD_PROMPT,
+    CHARACTER_QUALITY_PROMPT,
 )
 from src.context.compressor import ContextCompressor
 from src.core.config import settings
-from src.core.state import AgentState, IntentType, WorkerState, EntityExtractionState, DeepAnalysisState
+from src.core.state import (
+    AgentState,
+    IntentType,
+    WorkerState,
+    EntityExtractionState,
+    DeepAnalysisState,
+    CharacterCardState,
+)
 from src.utils.llm_utils import create_llm, invoke_with_retry
-from src.utils.doc_parser import parse_file, parse_file_chunked
+from src.utils.doc_parser import parse_file_paragraph_chunked
+from src.utils.voice_mapper import VOICE_MAPPING_RULES_TEXT
 from langchain_openai import ChatOpenAI
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from src.utils.text_splitter import chunk_text_by_paragraphs
 
 # ===== 惰性初始化 =====
 llm: ChatOpenAI = None
@@ -201,11 +217,19 @@ def file_reader_node(state: AgentState) -> AgentState:
 
     logger.info(f"找到 {len(file_paths)} 个文件: {file_paths}")
 
-    chunk_size = settings.compression_chunk_size * 10
+    paragraphs_per_chunk = settings.paragraphs_per_chunk
+    chunk_overlap = settings.paragraph_overlap
+    max_chunk_chars = settings.max_chunk_chars
+
     all_chunks = []
     for fp in file_paths:
         try:
-            chunks = parse_file_chunked(fp, chunk_size=chunk_size)
+            chunks = parse_file_paragraph_chunked(
+                fp,
+                paragraphs_per_chunk=paragraphs_per_chunk,
+                overlap=chunk_overlap,
+                max_chunk_chars=max_chunk_chars,
+            )
             for chunk in chunks:
                 all_chunks.append(f"=== {os.path.basename(fp)} ===\n{chunk}")
         except Exception as e:
@@ -217,9 +241,10 @@ def file_reader_node(state: AgentState) -> AgentState:
         _record_step(state, "file_reader", tokens)
         return state
 
-    state.raw_context = "\n\n".join(all_chunks)
+    state.text_chunks = all_chunks
     state.extracted_file_paths = file_paths
-    logger.info(f"文件读取完成，共 {len(all_chunks)} 个文本块，总长度 {len(state.raw_context)} 字符")
+    total_chars = sum(len(c) for c in all_chunks)
+    logger.info(f"文件读取完成，共 {len(all_chunks)} 个段落块，总长度 {total_chars} 字符（未拼接全文）")
 
     _record_step(state, "file_reader", tokens)
     return state
@@ -248,17 +273,22 @@ def compress_context_node(state: AgentState) -> AgentState:
     _ensure_llm()
 
     raw = state.raw_context
+    chunks = list(state.text_chunks)
 
-    if state.context_path and not raw:
+    if state.context_path and not raw and not chunks:
         if not os.path.isfile(state.context_path):
             logger.error(f"文件不存在: {state.context_path}")
             state.compressed_context = ""
             _record_step(state, "compress_context")
             return state
 
-        chunk_size = 20000
         try:
-            chunks = parse_file_chunked(state.context_path, chunk_size=chunk_size)
+            chunks = parse_file_paragraph_chunked(
+                state.context_path,
+                paragraphs_per_chunk=settings.paragraphs_per_chunk,
+                overlap=settings.paragraph_overlap,
+                max_chunk_chars=settings.max_chunk_chars,
+            )
         except Exception as e:
             logger.error(f"文件解析失败: {e}")
             state.compressed_context = ""
@@ -270,42 +300,61 @@ def compress_context_node(state: AgentState) -> AgentState:
             state.compressed_context = ""
             _record_step(state, "compress_context")
             return state
-        elif len(chunks) == 1:
-            raw = chunks[0]
-        else:
-            logger.info(f"文件较大，分 {len(chunks)} 块解析")
-            raw = "\n\n".join(chunks)
 
-    if not raw:
+        state.text_chunks = chunks
+        logger.info(f"文件已按段落分块: {len(chunks)} 块")
+
+    if not raw and not chunks:
         raw = "\n".join([
             m.content for m in state.messages if isinstance(m, HumanMessage)
         ])
 
-    if not raw or len(raw) < 100:
-        state.compressed_context = raw
+    if not raw and not chunks:
+        state.compressed_context = ""
         _record_step(state, "compress_context")
         return state
 
+    if not chunks and raw and len(raw) >= 100:
+        if compressor.should_compress(raw):
+            logger.info(f"raw_context 较长，先按段落分块再压缩... (原始长度: {len(raw)} 字符)")
+            chunks = chunk_text_by_paragraphs(
+                raw,
+                paragraphs_per_chunk=settings.paragraphs_per_chunk,
+                overlap=settings.paragraph_overlap,
+                max_chunk_chars=settings.max_chunk_chars,
+            )
+            state.text_chunks = chunks
+        else:
+            state.compressed_context = raw
+            logger.info("上下文长度适中，无需压缩")
+            _record_step(state, "compress_context")
+            return state
+
     total_tokens = 0
 
-    if compressor.should_compress(raw):
-        logger.info(f"上下文过长，执行压缩... (原始长度: {len(raw)} 字符)")
-        strategy = state.compression_strategy
-        if strategy == "auto" or strategy == "AUTO":
-            strategy = "map_reduce"
-        compressed, tokens = _invoke_compressor(raw, strategy)
-        total_tokens += tokens
-        state.compressed_context = compressed
-        state.compression_ratio = len(compressed) / len(raw)
-        state.compression_strategy = "map_reduce"
+    if chunks:
+        combined_for_check = "\n\n".join(chunks)
+        if compressor.should_compress(combined_for_check):
+            logger.info(f"上下文过长，基于预分块执行压缩... (原始长度: {len(combined_for_check)} 字符, {len(chunks)} 块)")
+            strategy = state.compression_strategy
+            if strategy == "auto" or strategy == "AUTO":
+                strategy = "map_reduce"
+            compressed, tokens = _invoke_compressor_chunks(chunks, strategy)
+            total_tokens += tokens
+            state.compressed_context = compressed
+            state.compression_ratio = len(compressed) / len(combined_for_check) if combined_for_check else 0
+            state.compression_strategy = "map_reduce"
 
-        logger.info(f"压缩完成！压缩比: {state.compression_ratio:.2%}")
-        logger.info(f"原始: {len(raw)} 字符 → 压缩后: {len(compressed)} 字符")
+            logger.info(f"压缩完成！压缩比: {state.compression_ratio:.2%}")
+            logger.info(f"原始: {len(combined_for_check)} 字符 → 压缩后: {len(compressed)} 字符")
 
-        state.messages.append(
-            AIMessage(content=f"[系统] 已将长上下文压缩为 {len(compressed)} 字符的摘要")
-        )
-    else:
+            state.messages.append(
+                AIMessage(content=f"[系统] 已将长上下文（{len(chunks)} 个段落块）压缩为 {len(compressed)} 字符的摘要")
+            )
+        else:
+            state.compressed_context = combined_for_check
+            logger.info("上下文长度适中，无需压缩")
+    elif raw:
         state.compressed_context = raw
         logger.info("上下文长度适中，无需压缩")
 
@@ -323,15 +372,37 @@ def _invoke_compressor(text: str, strategy: str) -> Tuple[str, int]:
         return text, 0
 
 
+def _invoke_compressor_chunks(chunks: List[str], strategy: str) -> Tuple[str, int]:
+    _ensure_llm()
+    try:
+        compressed = compressor.compress_chunks(chunks, strategy=strategy)
+        return compressed, 0
+    except Exception as e:
+        logger.error(f"压缩失败: {e}")
+        return "\n\n".join(chunks), 0
+
+
 # ===== 任务拆解 =====
 
 def supervisor_node(state: AgentState) -> AgentState:
     context_to_use = state.compressed_context or state.raw_context
 
-    if state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS) and context_to_use:
+    if not context_to_use and state.text_chunks:
+        context_to_use = "\n\n".join(state.text_chunks[:3])
+
+    question = state.original_input
+    is_character = _is_character_analysis_request(question)
+
+    if is_character and state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS) and context_to_use:
+        state.is_character_analysis = True
+        prompt = CHARACTER_SUPERVISOR_PROMPT.format(
+            context=context_to_use[:8000],
+            question=question,
+        )
+    elif state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS) and context_to_use:
         prompt = DEEP_ANALYSIS_SUPERVISOR_PROMPT.format(
             context=context_to_use[:8000],
-            question=state.original_input,
+            question=question,
         )
     else:
         prompt = f"请根据用户需求执行：{state.original_input}"
@@ -343,9 +414,17 @@ def supervisor_node(state: AgentState) -> AgentState:
         state.task_plan = parsed
         state.entity_schema = parsed.get("entity_schema")
     except (json.JSONDecodeError, TypeError):
-        logger.warning("任务拆解 JSON 解析失败，使用兜底计划")
-        state.task_plan = {"tasks": [{"id": 1, "description": "全面分析", "assigned_to": "analyst_1", "role": "你是一个领域分析专家，擅长从给定角度进行深入分析。"}]}
-        state.entity_schema = None
+        if state.is_character_analysis:
+            logger.warning("任务拆解 JSON 解析失败，使用角色分析兜底计划")
+            state.task_plan = {"tasks": [{"id": 1, "description": "角色分析", "assigned_to": "character_analyst_1", "role": "角色分析专家"}]}
+            state.entity_schema = {
+                "entity_type": "角色",
+                "attributes": ["name", "aliases", "gender", "age", "personality", "alignment", "appearance", "background", "emotion"],
+            }
+        else:
+            logger.warning("任务拆解 JSON 解析失败，使用兜底计划")
+            state.task_plan = {"tasks": [{"id": 1, "description": "全面分析", "assigned_to": "analyst_1", "role": "你是一个领域分析专家，擅长从给定角度进行深入分析。"}]}
+            state.entity_schema = None
 
     tasks = state.task_plan.get("tasks", []) if state.task_plan else []
     schema_info = ""
@@ -353,10 +432,25 @@ def supervisor_node(state: AgentState) -> AgentState:
         schema_info = f" | 实体类型: {state.entity_schema.get('entity_type', '?')}, 属性: {state.entity_schema.get('attributes', [])}"
     _record_step(state, "supervisor", tokens)
     logger.info(f"任务拆解完成，共 {len(tasks)} 个子任务{schema_info}")
+    if state.is_character_analysis:
+        logger.info("🔤 识别为角色分析场景")
     for t in tasks:
         logger.info(f"  📋 {t.get('assigned_to', '?')}: {t.get('description', '?')}")
 
     return state
+
+
+_CHARACTER_KEYWORDS = [
+    "角色", "人物", "角色卡", "音色", "配音", "性格分析",
+    "voice", "character card", "角色复盘", "人物盘点", "音色生成",
+    "角色转变", "人物成长", "角色设定",
+]
+
+
+def _is_character_analysis_request(question: str) -> bool:
+    """判断用户需求是否属于角色分析场景"""
+    q = (question or "").lower()
+    return any(kw in question or kw in q for kw in _CHARACTER_KEYWORDS)
 
 
 # ===== 路由：有 entity_schema 走两阶段，否则走旧流程 =====
@@ -379,16 +473,21 @@ def route_after_supervisor(state: AgentState):
 
 def route_to_entity_extractors(state: AgentState):
     context_to_use = state.compressed_context or state.raw_context
+
     if not context_to_use or not state.entity_schema:
         return "entity_merge"
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.compression_chunk_size * 4,
-        chunk_overlap=int(settings.compression_chunk_size * 0.4),
-        length_function=len,
-    )
-    chunks = splitter.split_text(context_to_use)
-    logger.info(f"实体抽取：上下文分为 {len(chunks)} 个 chunk")
+    if state.text_chunks:
+        chunks = state.text_chunks
+        logger.info(f"实体抽取：使用 {len(chunks)} 个段落块直接分发")
+    else:
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.compression_chunk_size * 4,
+            chunk_overlap=int(settings.compression_chunk_size * 0.4),
+            length_function=len,
+        )
+        chunks = splitter.split_text(context_to_use)
+        logger.info(f"实体抽取：上下文重新分割为 {len(chunks)} 个 chunk")
 
     sends = []
     for i, chunk in enumerate(chunks):
@@ -397,9 +496,10 @@ def route_to_entity_extractors(state: AgentState):
             text=chunk,
             entity_type=state.entity_schema.get("entity_type", "实体"),
             attributes=", ".join(state.entity_schema.get("attributes", [])),
+            is_character_analysis=state.is_character_analysis,
         )
         sends.append(Send("entity_extraction", extraction_state))
-    logger.info(f"分发 {len(sends)} 个并行实体抽取 Worker")
+    logger.info(f"分发 {len(sends)} 个并行实体抽取 Worker (角色分析={state.is_character_analysis})")
     return sends
 
 
@@ -407,12 +507,18 @@ def entity_extraction_node(state: EntityExtractionState) -> dict:
     _ensure_llm()
     _worker_semaphore.acquire()
     try:
-        prompt = ENTITY_EXTRACTION_PROMPT.format(
-            entity_type=state.entity_type,
-            attributes=state.attributes,
-            text=state.text,
-        )
-        logger.info(f"  🔍 chunk {state.chunk_index} 正在抽取实体...")
+        if state.is_character_analysis:
+            prompt = CHARACTER_EXTRACTION_PROMPT.format(
+                chunk_index=state.chunk_index,
+                text=state.text,
+            )
+        else:
+            prompt = ENTITY_EXTRACTION_PROMPT.format(
+                entity_type=state.entity_type,
+                attributes=state.attributes,
+                text=state.text,
+            )
+        logger.info(f"  🔍 chunk {state.chunk_index} 正在抽取{'角色' if state.is_character_analysis else '实体'}...")
         start = time.time()
 
         content, tokens = invoke_with_retry(
@@ -429,11 +535,17 @@ def entity_extraction_node(state: EntityExtractionState) -> dict:
             if not isinstance(entities, list):
                 entities = []
         except (json.JSONDecodeError, TypeError):
-            logger.warning(f"  chunk {state.chunk_index} 实体 JSON 解析失败")
+            logger.warning(f"  chunk {state.chunk_index} {'角色' if state.is_character_analysis else '实体'} JSON 解析失败")
             entities = []
 
         elapsed = time.time() - start
-        logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个实体)")
+        logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个)")
+
+        # 为每个抽取的实体记录来源 chunk，保留时间线信息
+        for ent in entities:
+            if isinstance(ent, dict):
+                ent["source_chunks"] = [state.chunk_index]
+
         return {"extracted_entities": entities}
     finally:
         _worker_semaphore.release()
@@ -473,12 +585,18 @@ def entity_merge_node(state: AgentState) -> AgentState:
     return state
 
 
-def _merge_entities_batch(entities: list, schema: dict) -> list:
-    entity_type = schema.get("entity_type", "实体") if schema else "实体"
-    prompt = ENTITY_MERGE_PROMPT.format(
-        entity_type=entity_type,
-        entities=json.dumps(entities, ensure_ascii=False),
-    )
+def _merge_entities_batch(entities: list, schema: dict, is_character: bool = False) -> list:
+    entity_type = schema.get("entity_type", "角色" if is_character else "实体") if schema else ("角色" if is_character else "实体")
+
+    if is_character:
+        prompt = CHARACTER_MERGE_PROMPT.format(
+            entities=json.dumps(entities, ensure_ascii=False),
+        )
+    else:
+        prompt = ENTITY_MERGE_PROMPT.format(
+            entity_type=entity_type,
+            entities=json.dumps(entities, ensure_ascii=False),
+        )
     content, tokens = _invoke(prompt, fallback="[]", node_name="entity_merge")
     try:
         merged = json.loads(content)
@@ -489,6 +607,269 @@ def _merge_entities_batch(entities: list, schema: dict) -> list:
     return entities
 
 
+def entity_merge_node(state: AgentState) -> AgentState:
+    is_character = state.is_character_analysis
+    if not state.extracted_entities:
+        logger.warning("无实体抽取结果，跳过合并")
+        state.merged_entities = []
+        _record_step(state, "entity_merge")
+        return state
+
+    all_entities = []
+    for ent_list in state.extracted_entities:
+        if isinstance(ent_list, list):
+            all_entities.extend(ent_list)
+        elif isinstance(ent_list, dict):
+            all_entities.append(ent_list)
+
+    logger.info(f"实体合并：共 {len(all_entities)} 个原始{'角色' if is_character else '实体'}")
+
+    if is_character:
+        merged = _merge_character_entities(all_entities)
+        state.merged_entities = merged
+    elif len(all_entities) > 200:
+        batch_size = 200
+        merged_batches = []
+        for i in range(0, len(all_entities), batch_size):
+            batch = all_entities[i:i + batch_size]
+            merged = _merge_entities_batch(batch, state.entity_schema)
+            merged_batches.extend(merged)
+        state.merged_entities = merged_batches
+    else:
+        state.merged_entities = _merge_entities_batch(all_entities, state.entity_schema)
+
+    logger.info(f"实体合并完成：{len(state.merged_entities)} 个合并后{'角色' if is_character else '实体'}")
+    _record_step(state, "entity_merge")
+    return state
+
+
+def _merge_character_entities(all_entities: list) -> list:
+    """合并角色实体：按名称聚合，保留 source_chunks 进行转变检测"""
+    char_map = {}
+    for ent in all_entities:
+        if not isinstance(ent, dict):
+            continue
+        name = (ent.get("name") or "").strip()
+        if not name:
+            continue
+        if name not in char_map:
+            char_map[name] = {
+                "name": name,
+                "aliases": [],
+                "gender": "unknown",
+                "age": "",
+                "personality": "",
+                "alignment": "neutral",
+                "appearance": "",
+                "background": "",
+                "emotion": "",
+                "source_chunks": [],
+            }
+        target = char_map[name]
+        for key in ["aliases", "gender", "age", "personality", "alignment", "appearance", "background", "emotion"]:
+            val = ent.get(key)
+            if val and key == "aliases":
+                if isinstance(val, list):
+                    target["aliases"].extend(a for a in val if a and a not in target["aliases"])
+            elif val and key in ("age", "personality", "alignment", "emotion"):
+                # 收集多个时期的值，用于转变检测
+                vals = target.setdefault(f"{key}_all", [])
+                if isinstance(val, str):
+                    for part in val.split("、"):
+                        part = part.strip()
+                        if part and part not in vals:
+                            vals.append(part)
+                elif val not in vals:
+                    vals.append(val)
+                if not _is_val_set(target[key]) or key in ("personality", "emotion"):
+                    if isinstance(val, str):
+                        if target[key] and key in ("personality", "emotion"):
+                            for part in val.split("、"):
+                                part = part.strip()
+                                if part and part not in target[key].split("、"):
+                                    target[key] = target[key] + "、" + part if target[key] else part
+                        else:
+                            target[key] = val
+                    else:
+                        target[key] = val
+            elif val and not _is_val_set(target[key]):
+                target[key] = val
+        if isinstance(ent.get("source_chunks"), list):
+            target["source_chunks"].extend(c for c in ent["source_chunks"] if c not in target["source_chunks"])
+
+    merged = list(char_map.values())
+    for c in merged:
+        c["source_chunks"].sort()
+        c["aliases"] = list(dict.fromkeys(c["aliases"]))
+    return merged
+
+
+def _is_val_set(val) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return bool(val.strip())
+    return bool(val)
+
+
+# ===== 角色转变检测 =====
+
+def route_after_merge(state: AgentState):
+    """角色分析场景 → character_evolution；否则 → 原有 deep_analysis/aggregate"""
+    if state.is_character_analysis:
+        logger.info("route_after_merge: 走角色转变检测流程")
+        return "character_evolution"
+    logger.info("route_after_merge: 走原有深度分析流程")
+    return route_to_deep_analysts(state)
+
+
+def character_evolution_node(state: AgentState) -> AgentState:
+    """检测角色是否有显著转变，拆分为多个时期"""
+    if not state.merged_entities:
+        logger.warning("无合并角色，跳过转变检测")
+        _record_step(state, "character_evolution")
+        return state
+
+    evolution = {}
+    total_chunks = max(len(state.text_chunks), 1)
+
+    for ent in state.merged_entities:
+        if not isinstance(ent, dict):
+            continue
+        name = ent.get("name") or "unknown"
+        source_chunks = ent.get("source_chunks") or []
+        if not isinstance(source_chunks, list):
+            source_chunks = []
+
+        # 规则过滤：戏份太少或无跨度 → 不检测转变
+        if len(source_chunks) < 3:
+            evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
+            continue
+
+        span = max(source_chunks) - min(source_chunks) + 1
+        if span <= total_chunks * 0.2:
+            evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
+            continue
+
+        # 角色信息供 LLM 判断（含收集到的多个时期属性值）
+        entity_info = json.dumps({
+            "name": ent.get("name"),
+            "aliases": ent.get("aliases"),
+            "gender": ent.get("gender"),
+            "age": ent.get("age"),
+            "age_all": ent.get("age_all", []),
+            "personality": ent.get("personality"),
+            "personality_all": ent.get("personality_all", []),
+            "alignment": ent.get("alignment"),
+            "alignment_all": ent.get("alignment_all", []),
+        }, ensure_ascii=False)
+        prompt = CHARACTER_EVOLUTION_PROMPT.format(
+            name=name,
+            entity_info=entity_info,
+            source_chunks=str(source_chunks),
+        )
+        content, _ = _invoke(prompt, fallback="[]", node_name="character_evolution")
+        try:
+            periods = json.loads(content)
+            if not isinstance(periods, list) or not periods:
+                evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
+            else:
+                periods_list = []
+                for p in periods:
+                    attr = p.get("attributes", {})
+                    periods_list.append({
+                        "period_name": p.get("period_name", "时期"),
+                        "source_chunks": source_chunks,
+                        "name": name,
+                        "aliases": ent.get("aliases", []),
+                        "gender": attr.get("gender", ent.get("gender", "unknown")),
+                        "age": attr.get("age", ent.get("age", "")),
+                        "personality": attr.get("personality", ent.get("personality", "")),
+                        "alignment": attr.get("alignment", ent.get("alignment", "neutral")),
+                        "appearance": ent.get("appearance", ""),
+                        "background": ent.get("background", ""),
+                        "emotion": ent.get("emotion", ""),
+                    })
+                evolution[name] = periods_list
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"角色 {name} 转变检测 JSON 解析失败，按单时期处理")
+            evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
+
+    state.character_evolution = evolution
+    total_periods = sum(len(v) for v in evolution.values())
+    logger.info(f"角色转变检测完成：{len(evolution)} 个角色 → {total_periods} 个时期")
+    for name, periods in evolution.items():
+        logger.info(f"  人物 {name}: {[p['period_name'] for p in periods]}")
+    _record_step(state, "character_evolution")
+    return state
+
+
+def route_to_card_gens(state: AgentState):
+    """将每个角色（或角色的每个时期）分发到角色卡生成 Worker"""
+    if not state.character_evolution:
+        return "aggregate"
+
+    context_to_use = state.compressed_context or state.raw_context
+    if not context_to_use and state.text_chunks:
+        context_to_use = "\n\n".join(state.text_chunks[:3])
+
+    sends = []
+    card_id = 0
+    for name, periods in state.character_evolution.items():
+        for p in periods:
+            card_id += 1
+            card_state = CharacterCardState(
+                agent_id=f"card_gen_{card_id}",
+                character_info=json.dumps(p, ensure_ascii=False, indent=2),
+                period=p.get("period_name", "全程"),
+                context=context_to_use[:8000],
+                question=state.original_input,
+            )
+            sends.append(Send("character_card_gen", card_state))
+
+    logger.info(f"分发 {len(sends)} 个角色卡生成 Worker")
+    return sends
+
+
+def character_card_gen_node(state: CharacterCardState) -> dict:
+    _ensure_llm()
+    _worker_semaphore.acquire()
+    try:
+        prompt = CHARACTER_CARD_PROMPT.format(
+            character_info=state.character_info,
+            period=state.period,
+            voice_rules=VOICE_MAPPING_RULES_TEXT,
+        )
+        logger.info(f"  🎴 {state.agent_id} 正在生成角色卡 ({state.period})...")
+        start = time.time()
+
+        content, tokens = invoke_with_retry(
+            llm,
+            prompt,
+            max_retries=settings.llm_max_retries,
+            base_delay=settings.llm_retry_base_delay,
+            fallback="{}",
+        )
+
+        card = {}
+        try:
+            card = json.loads(content)
+            if not isinstance(card, dict):
+                card = {}
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"  {state.agent_id} 角色卡 JSON 解析失败")
+            card = {}
+
+        if card:
+            card.setdefault("period", state.period)
+
+        elapsed = time.time() - start
+        logger.info(f"  ✅ {state.agent_id} 角色卡生成完成 ({elapsed:.1f}s)")
+        return {"character_cards": [card]} if card else {"character_cards": []}
+    finally:
+        _worker_semaphore.release()
+
+
 # ===== 阶段2：深度分析（Reduce 并行） =====
 
 def route_to_deep_analysts(state: AgentState):
@@ -496,6 +877,8 @@ def route_to_deep_analysts(state: AgentState):
         return "aggregate"
 
     context_to_use = state.compressed_context or state.raw_context
+    if not context_to_use and state.text_chunks:
+        context_to_use = "\n\n".join(state.text_chunks[:3])
     tasks = state.task_plan.get("tasks", []) if state.task_plan else []
 
     sends = []
@@ -549,6 +932,8 @@ def deep_analysis_node(state: DeepAnalysisState) -> dict:
 
 def route_to_workers(state: AgentState):
     context_to_use = state.compressed_context or state.raw_context
+    if not context_to_use and state.text_chunks:
+        context_to_use = "\n\n".join(state.text_chunks[:3])
     tasks = state.task_plan.get("tasks", []) if state.task_plan else []
 
     if not tasks:
@@ -609,7 +994,12 @@ def aggregate_node(state: AgentState) -> AgentState:
 # ===== 质量自检 =====
 
 def quality_harness_node(state: AgentState) -> AgentState:
-    if state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS):
+    if state.is_character_analysis and state.character_cards:
+        prompt = CHARACTER_QUALITY_PROMPT.format(
+            question=state.original_input,
+            character_cards=json.dumps(state.character_cards, ensure_ascii=False),
+        )
+    elif state.intent in (IntentType.DEEP_ANALYSIS, IntentType.FILE_ANALYSIS):
         prompt = DEEP_ANALYSIS_QUALITY_PROMPT.format(
             question=state.original_input,
             tasks=json.dumps(state.task_plan, ensure_ascii=False) if state.task_plan else "{}",
@@ -670,6 +1060,8 @@ def build_agent_graph():
     workflow.add_node("supervisor", supervisor_node)
     workflow.add_node("entity_extraction", entity_extraction_node)
     workflow.add_node("entity_merge", entity_merge_node)
+    workflow.add_node("character_evolution", character_evolution_node)
+    workflow.add_node("character_card_gen", character_card_gen_node)
     workflow.add_node("deep_analysis", deep_analysis_node)
     workflow.add_node("worker", worker_agent_node)
     workflow.add_node("aggregate", aggregate_node)
@@ -700,19 +1092,28 @@ def build_agent_graph():
     workflow.add_edge("compress_context", "supervisor")
 
     # supervisor → 根据是否有 entity_schema 分流
-    # 有：并行 entity_extraction → entity_merge → 并行 deep_analysis → aggregate
-    # 无：并行 worker → aggregate
     workflow.add_conditional_edges(
         "supervisor",
         route_after_supervisor,
         [["entity_extraction", "worker"], "entity_merge", "aggregate"],
     )
     workflow.add_edge("entity_extraction", "entity_merge")
+
+    # entity_merge → 角色分析走 character_evolution，否则走 deep_analysis/aggregate
     workflow.add_conditional_edges(
         "entity_merge",
-        route_to_deep_analysts,
-        [["deep_analysis"], "aggregate"],
+        route_after_merge,
+        [["deep_analysis", "character_evolution"], "aggregate"],
     )
+
+    # 角色转变检测 → 并行角色卡生成 → aggregate
+    workflow.add_conditional_edges(
+        "character_evolution",
+        route_to_card_gens,
+        [["character_card_gen"], "aggregate"],
+    )
+    workflow.add_edge("character_card_gen", "aggregate")
+
     workflow.add_edge("deep_analysis", "aggregate")
     workflow.add_edge("worker", "aggregate")
 

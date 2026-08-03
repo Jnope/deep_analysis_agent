@@ -40,6 +40,7 @@ class EntityExtractionState(BaseModel):
     text: str = ""
     entity_type: str = ""
     attributes: str = ""
+    is_character_analysis: bool = False
 
     class Config:
         arbitrary_types_allowed = True
@@ -50,6 +51,18 @@ class DeepAnalysisState(BaseModel):
     agent_id: str = ""
     role: str = ""
     entity_info: str = ""
+    context: str = ""
+    question: str = ""
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class CharacterCardState(BaseModel):
+    """角色卡生成 Worker 的子状态"""
+    agent_id: str = ""
+    character_info: str = ""
+    period: str = ""
     context: str = ""
     question: str = ""
 
@@ -92,6 +105,7 @@ class AgentState(BaseModel):
     # ===== 上下文压缩 =====
     context_path: str = ""  # 文件路径，优先于 raw_context
     raw_context: str = ""
+    text_chunks: Annotated[List[str], _merge_list] = Field(default_factory=list)  # 段落分块，避免拼接全文
     compressed_context: Optional[str] = None
     compression_ratio: float = 0.0
     compression_strategy: CompressionStrategy = CompressionStrategy.AUTO
@@ -100,8 +114,11 @@ class AgentState(BaseModel):
     # ===== 任务编排 =====
     task_plan: Optional[dict] = None
     entity_schema: Optional[dict] = None
+    is_character_analysis: bool = False
     extracted_entities: Annotated[List[dict], _merge_list] = Field(default_factory=list)
     merged_entities: Optional[List[dict]] = None
+    character_evolution: Dict[str, List[dict]] = Field(default_factory=dict)
+    character_cards: Annotated[List[dict], _merge_list] = Field(default_factory=list)
     worker_results: Annotated[Dict[str, Any], _merge_dict] = Field(default_factory=dict)
     final_answer: Optional[str] = None
 

@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
@@ -54,6 +54,26 @@ class ContextCompressor:
         )
         docs = text_splitter.create_documents([text])
         logger.info(f"文本分割为 {len(docs)} 个 chunks (每个约 {self.chunk_size} 字符)")
+
+        if strategy == "map_reduce":
+            return self._map_reduce_summary(docs)
+        elif strategy == "stuff":
+            return self._stuff_summary(docs)
+        elif strategy == "extractive":
+            return self._extractive_summary(docs)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+
+    def compress_chunks(self, chunks: List[str], strategy: str = "map_reduce") -> str:
+        """对预分好的文本块列表进行压缩（避免先拼接再分割）。
+
+        将每个 chunk 视为一个独立的 Document，跳过递归分割步骤。
+        """
+        if len(chunks) <= 1 and not self.should_compress(chunks[0] if chunks else ""):
+            return chunks[0] if chunks else ""
+
+        docs = [Document(page_content=c) for c in chunks if c]
+        logger.info(f"使用预分块直接压缩: {len(docs)} 个文档块")
 
         if strategy == "map_reduce":
             return self._map_reduce_summary(docs)

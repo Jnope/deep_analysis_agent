@@ -1,7 +1,9 @@
 import os
-from typing import List
+from typing import List, Optional
 
 from loguru import logger
+
+from src.utils.text_splitter import chunk_by_paragraphs
 
 
 def parse_file(file_path: str) -> str:
@@ -39,6 +41,26 @@ def parse_file_chunked(file_path: str, chunk_size: int = 20000) -> List[str]:
         chunks.append(content[i:i + chunk_size])
     logger.info(f"文件分块: {len(chunks)} 块 (每块约 {chunk_size} 字符)")
     return chunks
+
+
+def parse_file_paragraph_chunked(
+    file_path: str,
+    paragraphs_per_chunk: int = 30,
+    overlap: int = 5,
+    max_chunk_chars: int = 20000,
+    encodings: Optional[List[str]] = None,
+) -> List[str]:
+    """基于段落的分块读取，流式加载不占内存。
+
+    直接委托给 text_splitter.chunk_by_paragraphs。
+    """
+    return chunk_by_paragraphs(
+        file_path=file_path,
+        paragraphs_per_chunk=paragraphs_per_chunk,
+        overlap=overlap,
+        max_chunk_chars=max_chunk_chars,
+        encodings=encodings,
+    )
 
 
 def _parse_txt(file_path: str) -> str:

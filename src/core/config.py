@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     compression_chunk_overlap: int = 200
     compression_strategy: str = "map_reduce"  # map_reduce | stuff | extractive
 
+    # Paragraph Chunking（段落分块）
+    paragraphs_per_chunk: int = 30       # 每块包含的最大段落数
+    paragraph_overlap: int = 5           # 相邻块之间重叠的段落数
+    max_chunk_chars: int = 20000         # 每块最大字符数（安全阀）
+
     # Agent Settings
     max_retries: int = 3
     quality_threshold: float = 0.7

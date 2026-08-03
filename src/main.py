@@ -1,4 +1,5 @@
 import argparse
+import json
 
 from src.core.graph import build_agent_graph
 from src.core.state import AgentState
@@ -47,7 +48,15 @@ def main():
     print(f"\n{'='*60}")
     print("【最终结果】")
 
-    if final_state.get("direct_answer"):
+    character_cards = final_state.get("character_cards")
+    if character_cards:
+        print(f"\n共生成 {len(character_cards)} 张角色卡：\n")
+        for i, card in enumerate(character_cards, 1):
+            name = card.get("name", "?")
+            period = card.get("period", "全程")
+            print(f"--- 角色卡 #{i}: {name} ({period}) ---")
+            # print(json.dumps(card, ensure_ascii=False, indent=2))
+    elif final_state.get("direct_answer"):
         print(final_state["direct_answer"])
     elif final_state.get("final_answer"):
         print(final_state["final_answer"])

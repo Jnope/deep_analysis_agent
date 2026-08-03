@@ -187,3 +187,152 @@ DEEP_ANALYSIS_QUALITY_PROMPT = """
     "overall": 0.85
 }}
 """
+
+# ===== 角色分析专用 Prompt =====
+
+CHARACTER_SUPERVISOR_PROMPT = """
+你是小说角色分析专家。根据以下上下文和用户需求，制定角色分析计划。
+
+你需要设定角色实体抽取的 schema，包括角色卡所需的所有属性。
+
+【上下文信息】
+{context}
+
+【用户需求】
+{question}
+
+请输出JSON格式的分析计划：
+{{
+    "entity_schema": {{
+        "entity_type": "角色",
+        "attributes": ["name", "aliases", "gender", "age", "personality", "alignment", "appearance", "background", "emotion"]
+    }},
+    "tasks": [
+        {{"id": 1, "description": "角色性格与音色分析", "assigned_to": "character_analyst_1", "role": "你是小说角色分析专家，擅长从文本中提取角色特征并生成角色卡"}}
+    ]
+}}
+"""
+
+CHARACTER_EXTRACTION_PROMPT = """
+你是小说角色分析专家。请从以下文本片段中提取所有出现的角色，并记录他们的属性。
+
+【文本片段】(第 {chunk_index} 块)
+{text}
+
+请提取每个角色的以下属性：
+- name: 角色名
+- aliases: 别名/绰号列表
+- gender: male/female/unknown
+- age: 年龄或年龄段（少年/青年/中年/老年/具体年龄）
+- personality: 性格特征关键词（3-5个）
+- alignment: good/evil/neutral
+- appearance: 外貌描述（如有）
+- background: 身份背景（如有）
+- emotion: 本片段中的主要情绪
+
+输出JSON数组，每个角色一个对象：
+[
+    {{"name": "角色名", "aliases": ["别名"], "gender": "male", "age": "青年", "personality": "坚韧、果断", "alignment": "good", "appearance": "...", "background": "...", "emotion": "..."}},
+    ...
+]
+
+如果没有找到任何角色，输出空数组 []。
+"""
+
+CHARACTER_MERGE_PROMPT = """
+你是角色合并专家。以下是从不同文本片段中提取的角色信息，可能存在重复、别名或矛盾。
+
+【待合并的角色列表】
+{entities}
+
+请执行以下操作：
+1. 合并同一角色的不同称呼（如"林动"和"林小子"应合并）
+2. 合并同一角色的多个属性片段，取最完整的信息
+3. 如果存在矛盾属性（如性格前后变化），保留所有版本并标注时期
+
+输出合并后的JSON数组：
+[
+    {{"name": "角色名", "aliases": ["别名1", "别名2"], "gender": "male", "age": "年龄", "personality": "性格描述", "alignment": "good/evil/neutral", "appearance": "外貌", "background": "背景", "emotion": "主要情绪"}},
+    ...
+]
+"""
+
+CHARACTER_EVOLUTION_PROMPT = """
+你是角色转变分析专家。以下是角色"{name}"在小说中的合并信息：
+
+【角色信息】
+{entity_info}
+
+【出现位置（chunk索引）】
+{source_chunks}
+
+请判断该角色是否经历了显著的性格、阵营或身份转变。
+判断标准（满足任一即算显著转变）：
+1. 性格关键词变化超过3个
+2. 阵营反转（good↔evil）
+3. 年龄跨度过大（如少年→中年→老年）
+4. 身份/地位剧变（如平民→帝王）
+
+若存在显著转变，请按时期划分，输出每个时期的属性快照：
+[
+    {{"period_name": "前期", "attributes": {{"personality": "...", "alignment": "...", "age": "..."}}}},
+    {{"period_name": "后期", "attributes": {{"personality": "...", "alignment": "...", "age": "..."}}}}
+]
+
+若不存在显著转变，输出空数组 []。
+"""
+
+CHARACTER_CARD_PROMPT = """
+你是角色卡设计专家。基于以下角色信息，生成完整的角色卡和音色参数。
+
+角色信息：{character_info}
+时期：{period}
+
+请输出JSON（仅输出JSON，不要其他内容）：
+{{
+    "name": "角色名",
+    "aliases": ["别名"],
+    "gender": "male/female",
+    "age": "年龄",
+    "personality": "性格描述",
+    "alignment": "good/evil/neutral",
+    "appearance": "外貌描述",
+    "background": "背景简介",
+    "period": "时期标识",
+    "voice_params": {{
+        "pitch": 50,
+        "speaking_rate": 50,
+        "energy": 50,
+        "tone": "warm",
+        "voice_type": "male_deep",
+        "description": "自然语言音色描述",
+        "ssml_style": "cheerful",
+        "ssml_pitch": "+5%",
+        "ssml_rate": "+0%"
+    }}
+}}
+
+{voice_rules}
+"""
+
+CHARACTER_QUALITY_PROMPT = """
+你是一个严格的质量评估员。请评估以下角色卡生成结果的质量。
+
+【原始需求】
+{question}
+
+【角色卡列表】
+{character_cards}
+
+请从以下维度打分（0-1分），仅输出JSON：
+1. 完整性：是否覆盖了小说中的所有主要角色？
+2. 准确性：角色属性是否准确，音色参数是否合理？
+3. 一致性：同一角色不同时期的属性是否连贯？
+
+{{
+    "completeness": 0.9,
+    "accuracy": 0.8,
+    "consistency": 0.85,
+    "overall": 0.85
+}}
+"""
