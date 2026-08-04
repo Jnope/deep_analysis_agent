@@ -7,12 +7,7 @@ FILE_PATH_EXTRACTION_PROMPT = """
 1. 提取所有看起来像文件路径的字符串（绝对路径、相对路径、带扩展名的文件名）
 2. 路径可能包含空格，用引号包裹的路径需要去掉引号
 3. 如果用户提到目录（如 ./docs/ 或 /home/user/reports），也提取
-4. 如果没有文件路径，返回空数组
-
-仅输出JSON，不要有其他内容：
-{{
-    "paths": ["/path/to/novel.txt"]
-}}
+4. 如果没有文件路径，paths 输出空数组
 
 用户问题：{question}
 """
@@ -23,24 +18,7 @@ CHARACTER_EXTRACTION_PROMPT = """
 【文本片段】(第 {chunk_index} 块)
 {text}
 
-请提取每个角色的以下属性：
-- name: 角色名（使用小说中最常用的称呼）
-- aliases: 别名/绰号列表。仅收录专属于该角色的独特称呼（如绰号、化名、江湖名号）。严禁收录通用称呼（如先生、公子、小姐、兄台、前辈、阁下、那位、此人）或对他人的泛指。
-- gender: male/female/unknown
-- age: 年龄或年龄段（少年/青年/中年/老年/具体年龄）
-- personality: 性格特征关键词（3-5个）
-- alignment: good/evil/neutral
-- appearance: 外貌描述（如有）
-- background: 身份背景（如有）
-- emotion: 本片段中的主要情绪
-
-输出JSON数组，每个角色一个对象：
-[
-    {{"name": "角色名", "aliases": ["专属绰号"], "gender": "male", "age": "青年", "personality": "坚韧、果断", "alignment": "good", "appearance": "...", "background": "...", "emotion": "..."}},
-    ...
-]
-
-如果没有找到任何角色，输出空数组 []。
+如果没有找到任何角色，输出空数组 items=[]。
 """
 
 ALIAS_CLEANUP_PROMPT = """
@@ -55,13 +33,9 @@ ALIAS_CLEANUP_PROMPT = """
 输入的角色列表：
 {characters}
 
-请输出清洗后的JSON数组，每个角色一个对象，aliases 仅保留专属称呼：
-[
-    {{"name": "角色名", "aliases": ["保留的专属别名"]}},
-    ...
-]
+请为每个角色只保留专属称呼，剔除上述无效别名。输出 items 数组，每个元素包含 name 和 aliases。
 
-如果一个角色的别名应全部剔除，aliases 输出空数组 []。
+如果一个角色的别名应全部剔除，aliases 输出空数组。
 """
 
 CHARACTER_EVOLUTION_PROMPT = """
@@ -82,13 +56,10 @@ CHARACTER_EVOLUTION_PROMPT = """
 3. 年龄跨度过大（如少年→中年→老年）
 4. 身份/地位剧变（如平民→帝王）
 
-若存在显著转变，请按时期划分，输出每个时期的属性快照（从对应 timeline 条目中取值）：
-[
-    {{"period_name": "前期", "chunk_range": [0, 15], "attributes": {{"age": "...", "personality": "...", "alignment": "..."}}}},
-    {{"period_name": "后期", "chunk_range": [16, 40], "attributes": {{"age": "...", "personality": "...", "alignment": "..."}}}}
-]
+若存在显著转变，请按时期划分，输出每个时期的属性快照（periods，从对应 timeline 条目中取值）：
+每个时期包含 period_name、chunk_range（[起始, 结束]）、attributes（含 age/personality/alignment）。
 
-若不存在显著转变，输出空数组 []。
+若不存在显著转变，periods 输出空数组。
 """
 
 CHARACTER_CARD_PROMPT = """
@@ -97,29 +68,8 @@ CHARACTER_CARD_PROMPT = """
 角色信息：{character_info}
 时期：{period}
 
-请输出JSON（仅输出JSON，不要其他内容）：
-{{
-    "name": "角色名",
-    "aliases": ["别名"],
-    "gender": "male/female",
-    "age": "年龄",
-    "personality": "性格描述",
-    "alignment": "good/evil/neutral",
-    "appearance": "外貌描述",
-    "background": "背景简介",
-    "period": "时期标识",
-    "voice_params": {{
-        "pitch": 50,
-        "speaking_rate": 50,
-        "energy": 50,
-        "tone": "warm",
-        "voice_type": "male_deep",
-        "description": "自然语言音色描述",
-        "ssml_style": "cheerful",
-        "ssml_pitch": "+5%",
-        "ssml_rate": "+0%"
-    }}
-}}
+请填充所有字段：name、aliases、gender、age、personality、alignment、appearance、background、period、voice_params。
+其中 voice_params 包含 pitch/speaking_rate/energy（0-100）、tone/voice_type/ssml_style、description、ssml_pitch/ssml_rate。
 
 {voice_rules}
 """
@@ -133,15 +83,5 @@ CHARACTER_QUALITY_PROMPT = """
 【角色卡列表】
 {character_cards}
 
-请从以下维度打分（0-1分），仅输出JSON：
-1. 完整性：是否覆盖了小说中的所有主要角色？
-2. 准确性：角色属性是否准确，音色参数是否合理？
-3. 一致性：同一角色不同时期的属性是否连贯？
-
-{{
-    "completeness": 0.9,
-    "accuracy": 0.8,
-    "consistency": 0.85,
-    "overall": 0.85
-}}
+请从以下维度打分（0-1分）：completeness（完整性，是否覆盖小说所有主要角色）、accuracy（准确性，角色属性是否准确、音色是否合理）、consistency（一致性，同一角色不同时期是否连贯）。综合分取 overall。
 """

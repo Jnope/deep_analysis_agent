@@ -4,7 +4,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Tuple
+from typing import Optional, Tuple
 
 from langgraph.constants import END
 from langgraph.graph import StateGraph
@@ -21,8 +21,17 @@ from src.agents.prompts import (
     FILE_PATH_EXTRACTION_PROMPT,
 )
 from src.core.config import settings
-from src.core.state import AgentState, EntityExtractionState, CharacterCardState
-from src.utils.llm_utils import create_llm, invoke_with_retry, safe_json_loads
+from src.core.state import (
+    AgentState,
+    EntityExtractionState,
+    CharacterCardState,
+    CharacterCard,
+    CharacterExtractionList,
+    QualityScore,
+    FilePathResult,
+    EvolutionResult,
+)
+from src.utils.llm_utils import create_llm, invoke_with_retry, structured_extract
 from src.utils.doc_parser import parse_file_paragraph_chunked
 from src.utils.voice_mapper import VOICE_MAPPING_RULES_TEXT
 
@@ -93,20 +102,15 @@ def _fuzzy_match_file(path: str) -> str:
 
 def file_reader_node(state: AgentState) -> AgentState:
     """从用户输入中解析小说文件路径，按段落流式分块，保留章节顺序。"""
+    _ensure_llm()
     prompt = FILE_PATH_EXTRACTION_PROMPT.format(question=state.original_input)
-    response, tokens = _invoke(prompt, fallback=json.dumps({"paths": [state.context_path]}), node_name="file_path_extraction")
+    result, tokens = structured_extract(llm, prompt, FilePathResult, max_retries=settings.llm_max_retries, base_delay=settings.llm_retry_base_delay)
 
     paths = []
-    try:
-        parsed = json.loads(response)
-        if isinstance(parsed, dict):
-            paths = parsed.get("paths", [])
-        elif isinstance(parsed, list):
-            paths = parsed
-    except (json.JSONDecodeError, TypeError):
-        logger.warning("文件路径提取 JSON 解析失败")
-        if state.context_path:
-            paths = [state.context_path]
+    if result is not None:
+        paths = result.paths
+    elif state.context_path:
+        paths = [state.context_path]
 
     file_paths = []
     for p in paths:
@@ -183,7 +187,7 @@ def route_after_file_reader(state: AgentState):
     for i, chunk in enumerate(state.text_chunks):
         extraction_state = EntityExtractionState(chunk_index=i, text=chunk)
         sends.append(Send("character_extraction", extraction_state))
-    logger.info(f"分发 {len(sends)} 个并行角色抽取 Worker")
+    logger.info(f"分发 {len(sends)} 个并行角色抽取 Worker，单次并行执行 {settings.max_concurrent_workers} 个")
     return sends
 
 
@@ -209,37 +213,27 @@ def character_extraction_node(state: EntityExtractionState) -> dict:
         logger.info(f"  🔍 chunk {state.chunk_index} 正在抽取角色...")
         start = time.time()
 
-        content, tokens = invoke_with_retry(
-            llm,
-            prompt,
+        result, extraction_tokens = structured_extract(
+            llm, prompt, CharacterExtractionList,
             max_retries=settings.llm_max_retries,
             base_delay=settings.llm_retry_base_delay,
-            fallback="[]",
         )
 
         entities = []
-        parsed = safe_json_loads(content)
-        if isinstance(parsed, list):
-            entities = parsed
-        else:
-            logger.warning(f"  chunk {state.chunk_index} 角色 JSON 解析失败，跳过")
-        entities = [e for e in entities if isinstance(e, dict)]
-
-        # 归一化：把 personality / emotion 的 list 形式转成顿号分隔字符串
-        for e in entities:
-            for k in ("personality", "emotion", "age"):
-                if isinstance(e.get(k), list):
-                    joined = "、".join(str(x).strip() for x in e[k] if str(x).strip())
-                    e[k] = joined or ""
+        if result is not None and result.items:
+            for item in result.items:
+                ent = item.model_dump()
+                ent["source_chunks"] = [state.chunk_index]
+                entities.append(ent)
 
         elapsed = time.time() - start
-        logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个角色)")
-
-        for ent in entities:
-            if isinstance(ent, dict):
-                ent["source_chunks"] = [state.chunk_index]
-
-        return {"extracted_entities": entities}
+        step = f"{datetime.now().strftime('%H:%M:%S')} | character_extraction chunk {state.chunk_index} | tokens={extraction_tokens}"
+        logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个角色, 结构化)")
+        return {
+            "extracted_entities": entities,
+            "total_tokens_used": extraction_tokens,
+            "execution_steps": [step],
+        }
     finally:
         _worker_semaphore.release()
 
@@ -262,45 +256,46 @@ def character_merge_node(state: AgentState) -> AgentState:
 
     logger.info(f"角色合并：共 {len(all_entities)} 个原始角色")
 
-    state.merged_entities = _merge_character_entities(all_entities)
+    state.merged_entities, merge_tokens = _merge_character_entities(all_entities)
     logger.info(f"角色合并完成：共 {len(state.merged_entities)} 个合并后角色")
-    _record_step(state, "character_merge")
+    _record_step(state, "character_merge", merge_tokens)
     return state
 
 
-def _clean_aliases_with_llm(char_map: dict) -> None:
+def _clean_aliases_with_llm(char_map: dict) -> int:
     """用 LLM 清洗所有角色的别名，剔除通用称呼/他人名字/描述性词语。
 
     原地修改 char_map 中每个角色的 aliases。
+    返回消耗的 tokens。
     """
     char_list = [{"name": c["name"], "aliases": list(c["aliases"])} for c in char_map.values()]
     if not char_list:
-        return
+        return 0
 
     prompt = ALIAS_CLEANUP_PROMPT.format(
         characters=json.dumps(char_list, ensure_ascii=False),
     )
     try:
-        content, _ = _invoke(prompt, fallback=json.dumps(char_list, ensure_ascii=False), node_name="alias_cleanup")
-        cleaned = safe_json_loads(content)
-        if not isinstance(cleaned, list):
-            return
-        name_to_aliases = {}
-        for item in cleaned:
-            if isinstance(item, dict) and item.get("name"):
-                name_to_aliases[item["name"]] = item.get("aliases", []) or []
-        for c in char_map.values():
-            if c["name"] in name_to_aliases:
-                kept = [a for a in name_to_aliases[c["name"]] if isinstance(a, str) and a and a != c["name"]]
-                c["aliases"] = list(dict.fromkeys(kept))
+        from src.core.state import AliasCleanupList
+        result, tokens = structured_extract(llm, prompt, AliasCleanupList, max_retries=settings.llm_max_retries, base_delay=settings.llm_retry_base_delay)
+        if result is not None:
+            name_to_aliases = {item.name: item.aliases for item in result.items}
+            for c in char_map.values():
+                if c["name"] in name_to_aliases:
+                    kept = [a for a in name_to_aliases[c["name"]] if a and a != c["name"]]
+                    c["aliases"] = list(dict.fromkeys(kept))
+        return tokens
     except Exception as e:
         logger.warning(f"别名清洗失败，保留原始别名: {e}")
+        return 0
 
 
-def _merge_character_entities(all_entities: list) -> list:
-    """合并角色：按名称+别名交叉聚合，保留每块的属性快照（timeline）。"""
+def _merge_character_entities(all_entities: list) -> tuple:
+    """合并角色：按名称+别名交叉聚合，保留每块的属性快照（timeline）。
+    返回 (merged_list, tokens)。
+    """
     if not all_entities:
-        return []
+        return [], 0
 
     # ---- Pass 1: 按精确 name 聚合，同时收集 timeline ----
     char_map: dict = {}
@@ -359,7 +354,7 @@ def _merge_character_entities(all_entities: list) -> list:
         target["timeline"].append(snapshot)
 
     # ---- Pass 1.5: LLM 清洗别名（剔除通用称呼、他人名字、描述性词语）----
-    _clean_aliases_with_llm(char_map)
+    alias_tokens = _clean_aliases_with_llm(char_map)
 
     # ---- Pass 2: 别名交叉合并 ----
     # 过滤通用称呼，避免两个角色因共有"公子""先生"等被误连
@@ -368,7 +363,7 @@ def _merge_character_entities(all_entities: list) -> list:
         "大叔", "大娘", "姑娘", "少年", "少女", "大人", "殿下", "陛下",
         "师父", "师姐", "师兄", "师弟", "师妹", "道友", "掌柜", "掌门",
         "本才子", "本座", "在下", "鄙人", "区区", "小可", "老夫", "老朽",
-        "小妞", "辣货", "漂亮小妞", "死人妖", "人妖公子", "西贝货",
+        "小妞"
     }
 
     def _is_specific_alias(a: str) -> bool:
@@ -427,7 +422,7 @@ def _merge_character_entities(all_entities: list) -> list:
         primary["timeline"].sort(key=lambda t: (t.get("chunk_index") is None, t.get("chunk_index")))
         merged.append(primary)
 
-    return merged
+    return merged, alias_tokens
 
 
 def _is_val_set(val) -> bool:
@@ -449,6 +444,7 @@ def character_evolution_node(state: AgentState) -> AgentState:
 
     evolution = {}
     total_chunks = max(len(state.text_chunks), 1)
+    total_tokens = 0
 
     for ent in state.merged_entities:
         if not isinstance(ent, dict):
@@ -479,27 +475,26 @@ def character_evolution_node(state: AgentState) -> AgentState:
             entity_info=entity_info,
             source_chunks=str(source_chunks),
         )
-        content, _ = _invoke(prompt, fallback="[]", node_name="character_evolution")
-        periods = safe_json_loads(content)
-        if not isinstance(periods, list) or not periods:
+        result, ev_tokens = structured_extract(llm, prompt, EvolutionResult, max_retries=settings.llm_max_retries, base_delay=settings.llm_retry_base_delay)
+        total_tokens += ev_tokens
+        periods = result.periods if result is not None else []
+        if not periods:
             evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
         else:
             periods_list = []
             for p in periods:
-                if not isinstance(p, dict):
-                    continue
-                attr = p.get("attributes", {}) or {}
-                chunk_range = p.get("chunk_range", [min(source_chunks), max(source_chunks)])
+                attr = p.attributes
+                chunk_range = p.chunk_range or [min(source_chunks), max(source_chunks)]
                 periods_list.append({
-                    "period_name": p.get("period_name", "时期"),
+                    "period_name": p.period_name or "时期",
                     "chunk_range": chunk_range,
                     "source_chunks": source_chunks,
                     "name": name,
                     "aliases": ent.get("aliases", []),
-                    "gender": attr.get("gender", ent.get("gender", "unknown")),
-                    "age": attr.get("age", ent.get("age", "")),
-                    "personality": attr.get("personality", ent.get("personality", "")),
-                    "alignment": attr.get("alignment", ent.get("alignment", "neutral")),
+                    "gender": ent.get("gender", "unknown"),
+                    "age": attr.age or ent.get("age", ""),
+                    "personality": attr.personality or ent.get("personality", ""),
+                    "alignment": attr.alignment or ent.get("alignment", "neutral"),
                     "appearance": ent.get("appearance", ""),
                     "background": ent.get("background", ""),
                     "emotion": ent.get("emotion", ""),
@@ -512,7 +507,7 @@ def character_evolution_node(state: AgentState) -> AgentState:
     logger.info(f"角色转变检测完成：{len(evolution)} 个角色 → {total_periods} 个时期")
     for name, periods in evolution.items():
         logger.info(f"  人物 {name}: {[p['period_name'] for p in periods]}")
-    _record_step(state, "character_evolution")
+    _record_step(state, "character_evolution", total_tokens)
     return state
 
 
@@ -553,27 +548,26 @@ def character_card_gen_node(state: CharacterCardState) -> dict:
         logger.info(f"  🎴 {state.agent_id} 正在生成角色卡 ({state.period})...")
         start = time.time()
 
-        content, tokens = invoke_with_retry(
-            llm,
-            prompt,
+        card_model, card_tokens = structured_extract(
+            llm, prompt, CharacterCard,
             max_retries=settings.llm_max_retries,
             base_delay=settings.llm_retry_base_delay,
-            fallback="{}",
         )
 
-        card = {}
-        parsed_card = safe_json_loads(content)
-        if isinstance(parsed_card, dict):
-            card = parsed_card
-        else:
-            logger.warning(f"  {state.agent_id} 角色卡 JSON 解析失败")
-
-        if card:
+        if card_model is not None:
+            card = card_model.model_dump()
             card.setdefault("period", state.period)
-
-        elapsed = time.time() - start
-        logger.info(f"  ✅ {state.agent_id} 角色卡生成完成 ({elapsed:.1f}s)")
-        return {"character_cards": {state.agent_id: card}} if card else {"character_cards": {}}
+            elapsed = time.time() - start
+            step = f"{datetime.now().strftime('%H:%M:%S')} | {state.agent_id} | tokens={card_tokens}"
+            logger.info(f"  ✅ {state.agent_id} 角色卡生成完成 ({elapsed:.1f}s, 结构化, tokens={card_tokens})")
+            return {
+                "character_cards": {state.agent_id: card},
+                "total_tokens_used": card_tokens,
+                "execution_steps": [step],
+            }
+        else:
+            logger.warning(f"  {state.agent_id} 角色卡结构化输出失败")
+            return {"character_cards": {}, "total_tokens_used": card_tokens}
     finally:
         _worker_semaphore.release()
 
@@ -598,26 +592,20 @@ def qual_check_node(state: AgentState) -> AgentState:
         question=state.original_input,
         character_cards=json.dumps(cards_list, ensure_ascii=False),
     )
-    response, tokens = _invoke(prompt, fallback=json.dumps({"overall": 0.5}), node_name="qual_check")
-    scores = safe_json_loads(response)
-    if isinstance(scores, dict):
-        state.quality_score = scores.get("overall", 0.5)
-        state.quality_details = scores
+    score_model, tokens = structured_extract(
+        llm, prompt, QualityScore,
+        max_retries=settings.llm_max_retries,
+        base_delay=settings.llm_retry_base_delay,
+    )
+    if score_model is not None:
+        state.quality_score = score_model.overall
+        state.quality_details = score_model.model_dump()
     else:
-        logger.warning(f"质量评估 JSON 解析失败: {response[:100]}")
+        logger.warning("质量评分结构化输出失败")
         state.quality_score = 0.5
 
     _record_step(state, "qual_check", tokens)
     logger.info(f"角色卡质量评分: {state.quality_score:.2f}")
-    return state
-
-
-def aggregate_node(state: AgentState) -> AgentState:
-    if not state.character_cards:
-        logger.warning("无角色卡汇总")
-    else:
-        logger.info(f"汇总 {len(state.character_cards)} 张角色卡")
-    _record_step(state, "aggregate")
     return state
 
 
@@ -633,7 +621,6 @@ def build_agent_graph():
     workflow.add_node("character_merge", character_merge_node)
     workflow.add_node("character_evolution", character_evolution_node)
     workflow.add_node("character_card_gen", character_card_gen_node)
-    workflow.add_node("aggregate", aggregate_node)
     workflow.add_node("qual_check", qual_check_node)
 
     workflow.set_entry_point("entry")
@@ -652,15 +639,13 @@ def build_agent_graph():
     workflow.add_edge("character_extraction", "character_merge")
     workflow.add_edge("character_merge", "character_evolution")
 
-    # 演变检测 → 并行角色卡生成 → 汇总
+    # 演变检测 → 并行角色卡生成 → 质量自检
     workflow.add_conditional_edges(
         "character_evolution",
         route_to_card_gens,
-        [["character_card_gen"], "aggregate"],
+        [["character_card_gen"], "qual_check"],
     )
-    workflow.add_edge("character_card_gen", "aggregate")
-
-    workflow.add_edge("aggregate", "qual_check")
+    workflow.add_edge("character_card_gen", "qual_check")
 
     workflow.add_edge("qual_check", END)
 
