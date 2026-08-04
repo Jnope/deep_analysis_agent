@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     paragraphs_per_chunk: int = 30       # 每块包含的最大段落数
     paragraph_overlap: int = 5           # 相邻块之间重叠的段落数
     max_chunk_chars: int = 20000         # 每块最大字符数（安全阀）
+    parse_only_chunks: int = 0           # 只处理前 N 个段落块；0 = 处理全部（测试用）
 
     # Agent Settings
     max_retries: int = 3

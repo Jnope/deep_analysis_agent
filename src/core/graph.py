@@ -17,11 +17,12 @@ from src.agents.prompts import (
     CHARACTER_EVOLUTION_PROMPT,
     CHARACTER_CARD_PROMPT,
     CHARACTER_QUALITY_PROMPT,
+    ALIAS_CLEANUP_PROMPT,
     FILE_PATH_EXTRACTION_PROMPT,
 )
 from src.core.config import settings
 from src.core.state import AgentState, EntityExtractionState, CharacterCardState
-from src.utils.llm_utils import create_llm, invoke_with_retry
+from src.utils.llm_utils import create_llm, invoke_with_retry, safe_json_loads
 from src.utils.doc_parser import parse_file_paragraph_chunked
 from src.utils.voice_mapper import VOICE_MAPPING_RULES_TEXT
 
@@ -59,7 +60,7 @@ def _record_step(state: AgentState, node_name: str, tokens: int = 0):
 
 # ===== 文件读取 =====
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".doc", ".html", ".htm"}
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".pdf", ".docx", ".doc", ".html", ".htm", ".epub"}
 
 
 def _fuzzy_match_file(path: str) -> str:
@@ -154,6 +155,12 @@ def file_reader_node(state: AgentState) -> AgentState:
         _record_step(state, "file_reader", tokens)
         return state
 
+    # 可选：只处理前 N 个段落块（测试用/快速验证，默认处理全部）
+    limit = settings.parse_only_chunks
+    if limit > 0 and len(all_chunks) > limit:
+        logger.info(f"PARSE_ONLY_CHUNKS 生效：仅处理前 {limit}/{len(all_chunks)} 个段落块")
+        all_chunks = all_chunks[:limit]
+
     state.text_chunks = all_chunks
     state.extracted_file_paths = file_paths
     state.is_character_analysis = True
@@ -211,13 +218,19 @@ def character_extraction_node(state: EntityExtractionState) -> dict:
         )
 
         entities = []
-        try:
-            entities = json.loads(content)
-            if not isinstance(entities, list):
-                entities = []
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(f"  chunk {state.chunk_index} 角色 JSON 解析失败")
-            entities = []
+        parsed = safe_json_loads(content)
+        if isinstance(parsed, list):
+            entities = parsed
+        else:
+            logger.warning(f"  chunk {state.chunk_index} 角色 JSON 解析失败，跳过")
+        entities = [e for e in entities if isinstance(e, dict)]
+
+        # 归一化：把 personality / emotion 的 list 形式转成顿号分隔字符串
+        for e in entities:
+            for k in ("personality", "emotion", "age"):
+                if isinstance(e.get(k), list):
+                    joined = "、".join(str(x).strip() for x in e[k] if str(x).strip())
+                    e[k] = joined or ""
 
         elapsed = time.time() - start
         logger.info(f"  ✅ chunk {state.chunk_index} 抽取完成 ({elapsed:.1f}s, {len(entities)} 个角色)")
@@ -253,6 +266,35 @@ def character_merge_node(state: AgentState) -> AgentState:
     logger.info(f"角色合并完成：共 {len(state.merged_entities)} 个合并后角色")
     _record_step(state, "character_merge")
     return state
+
+
+def _clean_aliases_with_llm(char_map: dict) -> None:
+    """用 LLM 清洗所有角色的别名，剔除通用称呼/他人名字/描述性词语。
+
+    原地修改 char_map 中每个角色的 aliases。
+    """
+    char_list = [{"name": c["name"], "aliases": list(c["aliases"])} for c in char_map.values()]
+    if not char_list:
+        return
+
+    prompt = ALIAS_CLEANUP_PROMPT.format(
+        characters=json.dumps(char_list, ensure_ascii=False),
+    )
+    try:
+        content, _ = _invoke(prompt, fallback=json.dumps(char_list, ensure_ascii=False), node_name="alias_cleanup")
+        cleaned = safe_json_loads(content)
+        if not isinstance(cleaned, list):
+            return
+        name_to_aliases = {}
+        for item in cleaned:
+            if isinstance(item, dict) and item.get("name"):
+                name_to_aliases[item["name"]] = item.get("aliases", []) or []
+        for c in char_map.values():
+            if c["name"] in name_to_aliases:
+                kept = [a for a in name_to_aliases[c["name"]] if isinstance(a, str) and a and a != c["name"]]
+                c["aliases"] = list(dict.fromkeys(kept))
+    except Exception as e:
+        logger.warning(f"别名清洗失败，保留原始别名: {e}")
 
 
 def _merge_character_entities(all_entities: list) -> list:
@@ -316,8 +358,27 @@ def _merge_character_entities(all_entities: list) -> list:
                 snapshot[key] = v
         target["timeline"].append(snapshot)
 
+    # ---- Pass 1.5: LLM 清洗别名（剔除通用称呼、他人名字、描述性词语）----
+    _clean_aliases_with_llm(char_map)
+
     # ---- Pass 2: 别名交叉合并 ----
-    # 构建 name/alias → canonical name 映射（并查集）
+    # 过滤通用称呼，避免两个角色因共有"公子""先生"等被误连
+    GENERIC_TITLES = {
+        "先生", "小姐", "公子", "兄台", "前辈", "阁下", "那位", "此人",
+        "大叔", "大娘", "姑娘", "少年", "少女", "大人", "殿下", "陛下",
+        "师父", "师姐", "师兄", "师弟", "师妹", "道友", "掌柜", "掌门",
+        "本才子", "本座", "在下", "鄙人", "区区", "小可", "老夫", "老朽",
+        "小妞", "辣货", "漂亮小妞", "死人妖", "人妖公子", "西贝货",
+    }
+
+    def _is_specific_alias(a: str) -> bool:
+        a = (a or "").strip()
+        if not a or len(a) <= 1:
+            return False
+        if a in GENERIC_TITLES:
+            return False
+        return True
+
     parent = {name: name for name in char_map}
 
     def find(x):
@@ -331,13 +392,13 @@ def _merge_character_entities(all_entities: list) -> list:
         if ra != rb:
             parent[ra] = rb
 
-    # 对每对角色，检查 name/aliases 是否有交集
+    # 对每对角色，双向确认才合并：A.name ∈ B.aliases 且 B.name ∈ A.aliases
     names = list(char_map.keys())
     for i, name_a in enumerate(names):
         for name_b in names[i + 1:]:
-            aliases_a = set(char_map[name_a]["aliases"]) | {name_a}
-            aliases_b = set(char_map[name_b]["aliases"]) | {name_b}
-            if aliases_a & aliases_b:
+            aliases_a = set(char_map[name_a]["aliases"])
+            aliases_b = set(char_map[name_b]["aliases"])
+            if (name_a in aliases_b and name_b in aliases_a) or name_a == name_b:
                 union(name_a, name_b)
 
     # 按 canonical 分组
@@ -362,7 +423,7 @@ def _merge_character_entities(all_entities: list) -> list:
             primary["timeline"].extend(other["timeline"])
 
         primary["source_chunks"].sort()
-        primary["aliases"] = list(dict.fromkeys(primary["aliases"]))
+        primary["aliases"] = [a for a in dict.fromkeys(primary["aliases"]) if _is_specific_alias(a) and a != primary["name"]]
         primary["timeline"].sort(key=lambda t: (t.get("chunk_index") is None, t.get("chunk_index")))
         merged.append(primary)
 
@@ -419,34 +480,32 @@ def character_evolution_node(state: AgentState) -> AgentState:
             source_chunks=str(source_chunks),
         )
         content, _ = _invoke(prompt, fallback="[]", node_name="character_evolution")
-        try:
-            periods = json.loads(content)
-            if not isinstance(periods, list) or not periods:
-                evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
-            else:
-                periods_list = []
-                for p in periods:
-                    attr = p.get("attributes", {})
-                    chunk_range = p.get("chunk_range", [min(source_chunks), max(source_chunks)])
-                    periods_list.append({
-                        "period_name": p.get("period_name", "时期"),
-                        "chunk_range": chunk_range,
-                        "source_chunks": source_chunks,
-                        "name": name,
-                        "aliases": ent.get("aliases", []),
-                        "gender": attr.get("gender", ent.get("gender", "unknown")),
-                        "age": attr.get("age", ent.get("age", "")),
-                        "personality": attr.get("personality", ent.get("personality", "")),
-                        "alignment": attr.get("alignment", ent.get("alignment", "neutral")),
-                        "appearance": ent.get("appearance", ""),
-                        "background": ent.get("background", ""),
-                        "emotion": ent.get("emotion", ""),
-                        "timeline": ent.get("timeline", []),
-                    })
-                evolution[name] = periods_list
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(f"角色 {name} 转变检测 JSON 解析失败，按单时期处理")
+        periods = safe_json_loads(content)
+        if not isinstance(periods, list) or not periods:
             evolution[name] = [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
+        else:
+            periods_list = []
+            for p in periods:
+                if not isinstance(p, dict):
+                    continue
+                attr = p.get("attributes", {}) or {}
+                chunk_range = p.get("chunk_range", [min(source_chunks), max(source_chunks)])
+                periods_list.append({
+                    "period_name": p.get("period_name", "时期"),
+                    "chunk_range": chunk_range,
+                    "source_chunks": source_chunks,
+                    "name": name,
+                    "aliases": ent.get("aliases", []),
+                    "gender": attr.get("gender", ent.get("gender", "unknown")),
+                    "age": attr.get("age", ent.get("age", "")),
+                    "personality": attr.get("personality", ent.get("personality", "")),
+                    "alignment": attr.get("alignment", ent.get("alignment", "neutral")),
+                    "appearance": ent.get("appearance", ""),
+                    "background": ent.get("background", ""),
+                    "emotion": ent.get("emotion", ""),
+                    "timeline": ent.get("timeline", []),
+                })
+            evolution[name] = periods_list if periods_list else [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
 
     state.character_evolution = evolution
     total_periods = sum(len(v) for v in evolution.values())
@@ -503,13 +562,11 @@ def character_card_gen_node(state: CharacterCardState) -> dict:
         )
 
         card = {}
-        try:
-            card = json.loads(content)
-            if not isinstance(card, dict):
-                card = {}
-        except (json.JSONDecodeError, TypeError):
+        parsed_card = safe_json_loads(content)
+        if isinstance(parsed_card, dict):
+            card = parsed_card
+        else:
             logger.warning(f"  {state.agent_id} 角色卡 JSON 解析失败")
-            card = {}
 
         if card:
             card.setdefault("period", state.period)
@@ -542,11 +599,11 @@ def qual_check_node(state: AgentState) -> AgentState:
         character_cards=json.dumps(cards_list, ensure_ascii=False),
     )
     response, tokens = _invoke(prompt, fallback=json.dumps({"overall": 0.5}), node_name="qual_check")
-    try:
-        scores = json.loads(response)
+    scores = safe_json_loads(response)
+    if isinstance(scores, dict):
         state.quality_score = scores.get("overall", 0.5)
         state.quality_details = scores
-    except (json.JSONDecodeError, TypeError):
+    else:
         logger.warning(f"质量评估 JSON 解析失败: {response[:100]}")
         state.quality_score = 0.5
 

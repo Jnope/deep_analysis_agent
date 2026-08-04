@@ -1,3 +1,5 @@
+import json
+import re
 import time
 from typing import Optional, Tuple
 
@@ -5,6 +7,35 @@ from langchain_openai import ChatOpenAI
 from loguru import logger
 
 from src.core.config import settings
+
+
+def safe_json_loads(content: str):
+    """健壮地解析 LLM 返回的 JSON。
+
+    处理以下常见情况：
+    - markdown 代码块围栏（```json ... ```）
+    - 前后多余文本/空白
+    - 直接是数组或对象
+    解析失败返回 None。
+    """
+    if not content:
+        return None
+    text = content.strip()
+    if not text:
+        return None
+
+    # 去掉 markdown 代码块围栏
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+
+    for candidate in (text,):
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return None
 
 
 def create_llm() -> ChatOpenAI:

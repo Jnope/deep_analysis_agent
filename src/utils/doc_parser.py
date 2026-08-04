@@ -20,6 +20,7 @@ def parse_file(file_path: str) -> str:
         ".doc": _parse_docx,
         ".html": _parse_html,
         ".htm": _parse_html,
+        ".epub": _parse_epub,
     }
 
     parser = parsers.get(ext)
@@ -50,16 +51,29 @@ def parse_file_paragraph_chunked(
     max_chunk_chars: int = 20000,
     encodings: Optional[List[str]] = None,
 ) -> List[str]:
-    """基于段落的分块读取，流式加载不占内存。
+    """基于段落的分块读取。
 
-    直接委托给 text_splitter.chunk_by_paragraphs。
+    - 纯文本格式（.txt/.md）：委托 text_splitter.chunk_by_paragraphs 流式读取，不占内存。
+    - 复合格式（.pdf/.docx/.html/.epub）：先 parse_file 提取全文，再按段落分块。
     """
-    return chunk_by_paragraphs(
-        file_path=file_path,
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in (".txt", ".md"):
+        return chunk_by_paragraphs(
+            file_path=file_path,
+            paragraphs_per_chunk=paragraphs_per_chunk,
+            overlap=overlap,
+            max_chunk_chars=max_chunk_chars,
+            encodings=encodings,
+        )
+
+    from src.utils.text_splitter import chunk_text_by_paragraphs
+
+    content = parse_file(file_path)
+    return chunk_text_by_paragraphs(
+        content,
         paragraphs_per_chunk=paragraphs_per_chunk,
         overlap=overlap,
         max_chunk_chars=max_chunk_chars,
-        encodings=encodings,
     )
 
 
@@ -133,3 +147,24 @@ def _parse_html(file_path: str) -> str:
     text = soup.get_text(separator="\n", strip=True)
     lines = [line for line in text.splitlines() if line.strip()]
     return "\n".join(lines)
+
+
+def _parse_epub(file_path: str) -> str:
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+
+    book = epub.read_epub(file_path, options={"ignore_ncx": True})
+    parts = []
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        html = item.get_content()
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "header", "footer"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        lines = [line for line in text.splitlines() if line.strip()]
+        if lines:
+            parts.append("\n".join(lines))
+
+    logger.info(f"EPUB: {len(parts)} 个文档章节")
+    return "\n\n".join(parts)

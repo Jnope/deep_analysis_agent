@@ -24,8 +24,8 @@ CHARACTER_EXTRACTION_PROMPT = """
 {text}
 
 请提取每个角色的以下属性：
-- name: 角色名
-- aliases: 别名/绰号列表
+- name: 角色名（使用小说中最常用的称呼）
+- aliases: 别名/绰号列表。仅收录专属于该角色的独特称呼（如绰号、化名、江湖名号）。严禁收录通用称呼（如先生、公子、小姐、兄台、前辈、阁下、那位、此人）或对他人的泛指。
 - gender: male/female/unknown
 - age: 年龄或年龄段（少年/青年/中年/老年/具体年龄）
 - personality: 性格特征关键词（3-5个）
@@ -36,11 +36,32 @@ CHARACTER_EXTRACTION_PROMPT = """
 
 输出JSON数组，每个角色一个对象：
 [
-    {{"name": "角色名", "aliases": ["别名"], "gender": "male", "age": "青年", "personality": "坚韧、果断", "alignment": "good", "appearance": "...", "background": "...", "emotion": "..."}},
+    {{"name": "角色名", "aliases": ["专属绰号"], "gender": "male", "age": "青年", "personality": "坚韧、果断", "alignment": "good", "appearance": "...", "background": "...", "emotion": "..."}},
     ...
 ]
 
 如果没有找到任何角色，输出空数组 []。
+"""
+
+ALIAS_CLEANUP_PROMPT = """
+你是角色别名清洗专家。以下是从小说中提取的所有角色及其别名列表。请逐个角色筛选，只保留**专属于该角色的独特称呼**（如绰号、化名、江湖名号、亲密昵称）。
+
+必须剔除的别名类型：
+1. 通用称呼：先生、小姐、公子、兄台、前辈、阁下、大人、姑娘、大叔、大娘、师父、师兄、师姐、道友、掌柜、掌门、殿下、陛下等
+2. 人称代词/泛指：本才子、本座、在下、鄙人、小可、老夫、此人、那位、这厮、那厮等
+3. 别人的名字：如果某个别名实际是另一个独立角色的名字，则剔除
+4. 描述性词语而非称呼：如"辣货""漂亮小妞""死人妖"等纯描述
+
+输入的角色列表：
+{characters}
+
+请输出清洗后的JSON数组，每个角色一个对象，aliases 仅保留专属称呼：
+[
+    {{"name": "角色名", "aliases": ["保留的专属别名"]}},
+    ...
+]
+
+如果一个角色的别名应全部剔除，aliases 输出空数组 []。
 """
 
 CHARACTER_EVOLUTION_PROMPT = """

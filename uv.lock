@@ -616,6 +616,19 @@ wheels = [
 ]
 
 [[package]]
+name = "ebooklib"
+version = "0.20"
+source = { registry = "http://inner-nexus.transwarp.io:30033/repository/pypi/simple" }
+dependencies = [
+    { name = "lxml" },
+    { name = "six" },
+]
+sdist = { url = "http://inner-nexus.transwarp.io:30033/repository/pypi/packages/77/85/322e8882a582d4b707220d1929cfb74c125f2ba513991edbce40dbc462de/ebooklib-0.20.tar.gz", hash = "sha256:35e2f9d7d39907be8d39ae2deb261b19848945903ae3dbb6577b187ead69e985" }
+wheels = [
+    { url = "http://inner-nexus.transwarp.io:30033/repository/pypi/packages/bf/ee/aa015c5de8b0dc42a8e507eae8c2de5d1c0e068c896858fec6d502402ed6/ebooklib-0.20-py3-none-any.whl", hash = "sha256:fff5322517a37e31c972d27be7d982cc3928c16b3dcc5fd7e8f7c0f5d7bcf42b" },
+]
+
+[[package]]
 name = "execnet"
 version = "2.1.2"
 source = { registry = "http://inner-nexus.transwarp.io:30033/repository/pypi/simple" }
@@ -1841,6 +1854,7 @@ dependencies = [
     { name = "beautifulsoup4" },
     { name = "chromadb" },
     { name = "deepeval" },
+    { name = "ebooklib" },
     { name = "langchain" },
     { name = "langchain-classic" },
     { name = "langchain-community" },
@@ -1865,6 +1879,7 @@ requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.15.0" },
     { name = "chromadb", specifier = ">=1.5.9" },
     { name = "deepeval", specifier = ">=4.0.7" },
+    { name = "ebooklib", specifier = ">=0.20" },
     { name = "langchain", specifier = ">=1.3.11" },
     { name = "langchain-classic", specifier = ">=1.0.0" },
     { name = "langchain-community", specifier = ">=0.4.2" },
