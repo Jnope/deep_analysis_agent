@@ -60,6 +60,7 @@ class CharacterCard(BaseModel):
     appearance: str = Field(default="", description="外貌描述")
     background: str = Field(default="", description="身份背景")
     period: str = Field(default="全程", description="时期标识")
+    importance: Literal["protagonist", "supporting", "minor"] = Field(default="minor", description="角色重要程度：protagonist=主角(男一/女一), supporting=重要配角(二号等), minor=普通配角")
     voice_params: VoiceParams = Field(default_factory=VoiceParams, description="音色参数")
 
     @field_validator("personality", "age", "appearance", "background", "period", mode="before")
@@ -97,6 +98,14 @@ class CharacterCard(BaseModel):
             return VoiceParams(**v)
         return v
 
+    @field_validator("importance", mode="before")
+    @classmethod
+    def _coerce_importance(cls, v):
+        valid = {"protagonist", "supporting", "minor"}
+        if isinstance(v, str) and v.lower() in valid:
+            return v.lower()
+        return "minor"
+
 
 class CharacterExtraction(BaseModel):
     """角色抽取的结构化输出"""
@@ -109,6 +118,7 @@ class CharacterExtraction(BaseModel):
     appearance: str = Field(default="", description="外貌描述")
     background: str = Field(default="", description="身份背景")
     emotion: str = Field(default="", description="本片情绪")
+    importance: Literal["protagonist", "supporting", "minor"] = Field(default="minor", description="角色重要程度：protagonist=主角(男一/女一), supporting=重要配角(二号等), minor=普通配角")
 
     @field_validator("personality", "emotion", "age", mode="before")
     @classmethod
@@ -137,6 +147,14 @@ class CharacterExtraction(BaseModel):
         if isinstance(v, str):
             return [v]
         return v or []
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def _coerce_importance(cls, v):
+        valid = {"protagonist", "supporting", "minor"}
+        if isinstance(v, str) and v.lower() in valid:
+            return v.lower()
+        return "minor"
 
 
 class CharacterExtractionList(BaseModel):
@@ -215,6 +233,55 @@ class EvolutionPeriod(BaseModel):
 class EvolutionResult(BaseModel):
     """角色转变检测结果"""
     periods: List[EvolutionPeriod] = Field(default_factory=list, description="划分的时期列表，空表示无显著转变")
+
+
+class NarratorCard(BaseModel):
+    """旁白角色卡"""
+    name: str = Field(default="旁白", description="固定为旁白")
+    period: str = Field(default="全程", description="时期")
+    narrator_style: str = Field(default="", description="旁白风格描述")
+    voice_params: VoiceParams = Field(default_factory=VoiceParams, description="旁白音色参数")
+
+
+class Segment(BaseModel):
+    """分拣后的单个朗读片段"""
+    speaker: str = Field(default="旁白", description="说话者；角色名或'旁白'")
+    text: str = Field(default="", description="原文")
+    emotion: str = Field(default="平静", description="语气情绪")
+
+    @field_validator("text", "emotion", "speaker", mode="before")
+    @classmethod
+    def _coerce_str(cls, v):
+        return str(v) if v is not None else ""
+
+
+class SegmentationMarker(BaseModel):
+    """对话/旁白分拣标记（只含切割位置，不含文本）。
+
+    用于减少 LLM 输出量：LLM 只需返回每个片段的起止位置和说话者，
+    对应原文由后端按 [start, end) 切分生成。
+    """
+    start: int = Field(default=0, ge=0, description="该片段在原文中的起始字符下标（含）")
+    end: int = Field(default=0, ge=0, description="该片段在原文中的结束字符下标（不含）")
+    speaker: str = Field(default="旁白", description="说话者；角色名或'旁白'")
+    emotion: str = Field(default="平静", description="语气情绪")
+
+    @field_validator("start", "end", mode="before")
+    @classmethod
+    def _coerce_pos(cls, v):
+        try:
+            return max(0, int(v))
+        except (TypeError, ValueError):
+            return 0
+
+    @field_validator("emotion", "speaker", mode="before")
+    @classmethod
+    def _coerce_str(cls, v):
+        return str(v) if v is not None else ""
+
+class SegmentationMarkerResult(BaseModel):
+    """对话/旁白分拣标记结果（只含起止位置）"""
+    markers: List[SegmentationMarker] = Field(default_factory=list, description="分拣标记列表，按 start 升序排列")
 
 
 class QualityScore(BaseModel):
@@ -296,6 +363,7 @@ class AgentState(BaseModel):
     merged_entities: Optional[List[dict]] = None                                          # 合并去重后的角色
     character_evolution: Dict[str, List[dict]] = Field(default_factory=dict)              # 角色 → 时期列表
     character_cards: Annotated[Dict[str, dict], _merge_dict] = Field(default_factory=dict)  # agent_id → 角色卡
+    narrator_card: Optional[dict] = Field(default=None, description="旁白角色卡")
 
     # ===== 质量评估 =====
     quality_score: Optional[float] = None

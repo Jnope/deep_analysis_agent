@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     api_model: str = "gpt-4-turbo"
     openai_temperature: float = 0.0
     llm_request_timeout: int = 60
-    llm_max_retries: int = 3
+    llm_max_retries: int = 1
     llm_retry_base_delay: float = 1.0
     max_concurrent_workers: int = 5
 

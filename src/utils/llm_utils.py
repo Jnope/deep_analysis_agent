@@ -66,7 +66,7 @@ def create_llm() -> ChatOpenAI:
         temperature=settings.openai_temperature,
         base_url=settings.api_base_url or None,
         api_key=settings.api_key or None,
-        request_timeout=60,
+        request_timeout=settings.llm_request_timeout,
         max_retries=0,
     )
 
@@ -132,8 +132,9 @@ def structured_extract(
     llm: ChatOpenAI,
     prompt: str,
     output_model: Type[T],
-    max_retries: int = 3,
+    max_retries: int = 1,
     base_delay: float = 1.0,
+    back: bool = False,
 ) -> Tuple[Optional[T], int]:
     """用 with_structured_output 约束 LLM 返回 Pydantic 模型。
 
@@ -172,24 +173,26 @@ def structured_extract(
                     break
                 delay = base_delay * (2 ** attempt)
                 time.sleep(delay)
+    if back:
+        # 最终回退：普通调用 + safe_json_loads
+        logger.info("结构化输出不可用，回退到普通 JSON 解析")
+        content, tokens = invoke_with_retry(
+            llm, prompt,
+            max_retries=max_retries,
+            base_delay=base_delay,
+            fallback="",
+        )
+        parsed = safe_json_loads(content)
+        if parsed is not None:
+            try:
+                if isinstance(parsed, list):
+                    if "items" in getattr(output_model, "model_fields", {}):
+                        return output_model.model_validate({"items": parsed}), tokens
+                    return None, tokens
+                if isinstance(parsed, dict):
+                    return output_model.model_validate(parsed), tokens
+            except Exception as e:
+                logger.warning(f"回退解析 model_validate 失败: {e}")
+        return None, tokens
+    return None, 0
 
-    # 最终回退：普通调用 + safe_json_loads
-    logger.info("结构化输出不可用，回退到普通 JSON 解析")
-    content, tokens = invoke_with_retry(
-        llm, prompt,
-        max_retries=max_retries,
-        base_delay=base_delay,
-        fallback="",
-    )
-    parsed = safe_json_loads(content)
-    if parsed is not None:
-        try:
-            if isinstance(parsed, list):
-                if "items" in getattr(output_model, "model_fields", {}):
-                    return output_model.model_validate({"items": parsed}), tokens
-                return None, tokens
-            if isinstance(parsed, dict):
-                return output_model.model_validate(parsed), tokens
-        except Exception as e:
-            logger.warning(f"回退解析 model_validate 失败: {e}")
-    return None, tokens

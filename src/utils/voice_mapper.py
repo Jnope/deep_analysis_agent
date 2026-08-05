@@ -174,4 +174,8 @@ VOICE_MAPPING_RULES_TEXT = """
   good → tone 偏 warm/bright
   evil → tone 偏 cold/dark
   neutral → 不调整
+- 重要程度(importance) → 音色区分度策略：
+  protagonist(主角): pitch/rate/energy 偏移加大（偏离中性值更远），声线选择更有辨识度
+  supporting(重要配角): 正常偏移，与主角有明显区分
+  minor(普通配角): pitch/rate/energy 尽量接近中性（50附近），减少配角之间的差异
 """

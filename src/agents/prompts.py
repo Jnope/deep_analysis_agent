@@ -18,6 +18,10 @@ CHARACTER_EXTRACTION_PROMPT = """
 【文本片段】(第 {chunk_index} 块)
 {text}
 
+对每个角色输出：
+- name、aliases、gender、age、personality、alignment、appearance、background、emotion、importance
+注意：importance 应综合该角色在整本小说中的分量判断（主角主角通常贯穿全文，配角戏份有限）。无法判断时默认 "minor"，不要对所有角色都填 protagonist。
+
 如果没有找到任何角色，输出空数组 items=[]。
 """
 
@@ -71,6 +75,8 @@ CHARACTER_CARD_PROMPT = """
 请填充所有字段：name、aliases、gender、age、personality、alignment、appearance、background、period、voice_params。
 其中 voice_params 包含 pitch/speaking_rate/energy（0-100）、tone/voice_type/ssml_style、description、ssml_pitch/ssml_rate。
 
+importance 请根据角色信息中的重要程度保留（protagonist/supporting/minor），它用于决定音色区分度。
+
 {voice_rules}
 """
 
@@ -84,4 +90,44 @@ CHARACTER_QUALITY_PROMPT = """
 {character_cards}
 
 请从以下维度打分（0-1分）：completeness（完整性，是否覆盖小说所有主要角色）、accuracy（准确性，角色属性是否准确、音色是否合理）、consistency（一致性，同一角色不同时期是否连贯）。综合分取 overall。
+"""
+
+NARRATOR_CARD_PROMPT = """
+你是有声书旁白设计专家。根据小说的整体风格，设计一张旁白（Narrator）角色卡，用于整本的旁白朗读。
+
+【小说角色概览】（供参考语气风格）
+{character_cards}
+
+【小说片段】（感受叙事风格）
+{sample_text}
+
+请生成旁白角色卡：
+- name: 固定为 "旁白"
+- period: "全程"
+- narrator_style: 旁白风格描述（如"沉稳客观的说书人""悬疑低语""温情回忆式"等）
+- voice_params: 按旁白要求生成——
+  pitch/speaking_rate/energy（0-100）、tone/voice_type/ssml_style、description、ssml_pitch/ssml_rate
+  旁白通常：语速适中偏缓、语气沉稳客观、无强烈情绪、音色中性有辨识度、能作为其他角色的对比声线。
+"""
+
+DIALOGUE_SEGMENTATION_PROMPT = """
+你是有声书分拣专家。将给定的小说文本段落，逐句判断它属于"旁白"还是某个角色说话内容，并输出每个片段的起止位置。
+
+【角色名单】（含别名，用于识别说话人）
+{characters}
+
+【文本段落】（下方 {text} 中每个中文字符算 1 个字符，不能忽略标点符号）
+{text}
+"""
+
+NARRATOR_QUALITY_PROMPT = """
+你是一个严格的质量评估员。请评估以下旁白/对话分拣结果的质量。
+
+【原始需求】
+{question}
+
+【分拣结果】
+{segments}
+
+请从以下维度打分（0-1分）：accuracy（准确性，说话人归属是否正确）、completeness（完整性，是否覆盖所有句子）。综合分取 overall。
 """

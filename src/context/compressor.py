@@ -13,7 +13,7 @@ import tiktoken
 class ContextCompressor:
     """上下文压缩器 - 支持多种策略"""
 
-    def __init__(self, llm: ChatOpenAI, max_tokens: int = 8000, chunk_size: int = 8000, max_workers: int = 5, max_retries: int = 3):
+    def __init__(self, llm: ChatOpenAI, max_tokens: int = 8000, chunk_size: int = 8000, max_workers: int = 5, max_retries: int = 1):
         self.llm = llm
         self.max_tokens = max_tokens
         self.chunk_size = chunk_size

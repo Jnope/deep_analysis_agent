@@ -4,7 +4,7 @@ import os
 import time
 import threading
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Tuple
 
 from langgraph.constants import END
 from langgraph.graph import StateGraph
@@ -468,6 +468,7 @@ def character_evolution_node(state: AgentState) -> AgentState:
             "name": ent.get("name"),
             "aliases": ent.get("aliases"),
             "gender": ent.get("gender"),
+            "importance": ent.get("importance", "minor"),
             "timeline": ent.get("timeline", []),
         }, ensure_ascii=False)
         prompt = CHARACTER_EVOLUTION_PROMPT.format(
@@ -498,6 +499,7 @@ def character_evolution_node(state: AgentState) -> AgentState:
                     "appearance": ent.get("appearance", ""),
                     "background": ent.get("background", ""),
                     "emotion": ent.get("emotion", ""),
+                    "importance": ent.get("importance", "minor"),
                     "timeline": ent.get("timeline", []),
                 })
             evolution[name] = periods_list if periods_list else [{"period_name": "全程", "source_chunks": source_chunks, **ent}]
@@ -609,6 +611,30 @@ def qual_check_node(state: AgentState) -> AgentState:
     return state
 
 
+# ===== 阶段5：旁白卡生成 =====
+
+def narrator_card_gen_node(state: AgentState) -> AgentState:
+    """基于角色卡与小说片段生成旁白卡。"""
+    if not state.character_cards:
+        logger.warning("未生成角色卡，跳过旁白卡生成")
+        _record_step(state, "narrator_card_gen")
+        return state
+
+    cards_list = list(state.character_cards.values())
+    sample_text = "\n\n".join(state.text_chunks[:1]) if state.text_chunks else ""
+
+    from src.utils.tts_engine import generate_narrator_card
+    narrator, tokens = generate_narrator_card(cards_list, sample_text)
+    if narrator is not None:
+        state.narrator_card = narrator
+        logger.info(f"旁白卡生成完成, 风格: {narrator.get('narrator_style', '?')}")
+    else:
+        logger.warning("旁白卡生成失败")
+
+    _record_step(state, "narrator_card_gen", tokens)
+    return state
+
+
 # ===== 构建 Graph =====
 
 def build_agent_graph():
@@ -622,6 +648,7 @@ def build_agent_graph():
     workflow.add_node("character_evolution", character_evolution_node)
     workflow.add_node("character_card_gen", character_card_gen_node)
     workflow.add_node("qual_check", qual_check_node)
+    workflow.add_node("narrator_card_gen", narrator_card_gen_node)
 
     workflow.set_entry_point("entry")
 
@@ -647,6 +674,7 @@ def build_agent_graph():
     )
     workflow.add_edge("character_card_gen", "qual_check")
 
-    workflow.add_edge("qual_check", END)
+    workflow.add_edge("qual_check", "narrator_card_gen")
+    workflow.add_edge("narrator_card_gen", END)
 
     return workflow.compile()
