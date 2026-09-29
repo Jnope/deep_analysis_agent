@@ -27,3 +27,7 @@ dependencies = [
     "tiktoken>=0.13.0",
     "tqdm>=4.68.3", # 进度条
 ]
+
+[[tool.uv.index]]
+url="https://pypi.tuna.tsinghua.edu.cn/simple"
+default=true
